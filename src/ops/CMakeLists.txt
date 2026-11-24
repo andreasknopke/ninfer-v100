@@ -60,6 +60,10 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_rows/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_topk/sources.cmake")
+# SenseNova-Loop mHC residual streams (two-stream router, log-space Sinkhorn mix).
+include("${CMAKE_CURRENT_LIST_DIR}/mhc/sources.cmake")
+# SenseNova-Loop YaRN-scaled RoPE (frequency ramp + attention factor; rope.h stays unscaled).
+include("${CMAKE_CURRENT_LIST_DIR}/rope_yarn/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/moe_mix/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/moe_situ/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/offloaded_sparse_moe/sources.cmake")

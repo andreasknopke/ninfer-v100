@@ -132,6 +132,14 @@ ninfer_add_op_test(ninfer_hc_sinkhorn_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hc_sinkhorn.cpp"
   LIBRARIES ninfer_ops)
 # DeepSeek-V4's router (sqrt-softplus scores, biased selection, unbiased weights) against an FP64 oracle.
+# SenseNova-Loop YaRN RoPE (frequency ramp, attention factor, ramp endpoints) against FP64 oracles.
+ninfer_add_op_test(ninfer_rope_yarn_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_yarn.cpp"
+  LIBRARIES ninfer_ops)
+# SenseNova-Loop mHC (two-stream router, log-space Sinkhorn mix, merge, enter/leave) against FP64 oracles.
+ninfer_add_op_test(ninfer_mhc_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mhc.cpp"
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_moe_route_sqrt_softplus_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_route_sqrt_softplus.cpp"
   LIBRARIES ninfer_ops)
