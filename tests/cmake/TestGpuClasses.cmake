@@ -34,6 +34,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_engine_scheduling_test
   ninfer_dsv4_engine_plan_test
   ninfer_inkling2_prefill_plan_test
+  ninfer_sensenova_loop_plan_test
   ninfer_dsv4_frontend_real_test
   ninfer_dsv4_perf_model_test
   ninfer_qwen3_5_dsv4_tokenizer_test
