@@ -306,6 +306,16 @@ ModelConfig parse_config(const Json& root) {
     return out;
 }
 
+bool is_sensenova_loop_config(const artifact::Directory& directory) {
+    if (!directory.components.contains("text")) { return false; }
+    const auto& config = directory.component("text").config;
+    return config.contains("model_type") && config.at("model_type") == "sensenova_loop";
+}
+
+ModelConfig parse_config(const artifact::Directory& directory) {
+    return parse_config(directory.component("text").config);
+}
+
 ExecutionPlan build_plan(const ModelConfig& config) {
     return ExecutionPlan(config.text.num_hidden_layers,
                          LoopSettings{config.loop.start, config.loop.end, config.loop.visits},

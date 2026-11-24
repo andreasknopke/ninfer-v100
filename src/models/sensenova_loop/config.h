@@ -105,6 +105,16 @@ struct ModelConfig {
 // MTP block, a second looped range, a RoPE type other than YaRN) rather than quietly dropping it.
 [[nodiscard]] ModelConfig parse_config(const artifact::Json& root);
 
+// Recognition and loading for an artifact directory. The text component's config is the release
+// document itself, so the two overloads below see the same field set the JSON overload does.
+//
+// There is deliberately no `models::resolve_architecture` entry for this model. That function is the
+// Qwen3.5 reader's dispatcher, and the release's text block reports `model_type: qwen3_5_text`, so a
+// pair here would make the two families indistinguishable at exactly the point where they diverge.
+// DeepSeek-V4 set the precedent: a model with its own reader is recognised by its own predicate.
+[[nodiscard]] bool is_sensenova_loop_config(const artifact::Directory& directory);
+[[nodiscard]] ModelConfig parse_config(const artifact::Directory& directory);
+
 // The execution order implied by a text block and the loop settings. Kept out of ModelConfig so the
 // config stays a record of what the file said.
 [[nodiscard]] ExecutionPlan build_plan(const ModelConfig& config);
