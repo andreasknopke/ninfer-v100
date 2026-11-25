@@ -32,9 +32,13 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
+constexpr std::array<SupportSpec, 4> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
+    // SenseNova-Loop-9B: the attention and GDN output projections add into a 4096-wide residual
+    // over a 4096 hidden, and the MLP down projection over a 12288 intermediate.
+    {4096, 4096, 4096},
+    {4096, 12288, 12288},
 }};
 
 // The 2..10 band is measured too (2026-09-09, same bench, --tokens 1,2,4,6,8,10,12,16, medians of
@@ -153,6 +157,27 @@ constexpr std::array<RouteSpec, 7> kK17408Routes{{
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
 }};
 
+// SenseNova-Loop-9B's two widths. Neither is swept: on sm_70 the streaming GEMV serves every
+// extent up to kStreamGemvMaxTokens, and past that the k=6144 table's routes are the only ones
+// that exist, so they are reused unchanged rather than guessed at.
+constexpr std::array<RouteSpec, 6> kK4096Routes{{
+    {{1, 2}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{3, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
+    {{33, 103}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
+    {{104, 127}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{128, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
+}};
+
+constexpr std::array<RouteSpec, 6> kK12288Routes{{
+    {{1, 2}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{3, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
+    {{33, 103}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
+    {{104, 127}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{128, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
+}};
+
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
     std::int64_t expected = 1;
@@ -164,7 +189,8 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes) &&
+                  catalog_is_closed(kK4096Routes) && catalog_is_closed(kK12288Routes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
@@ -271,7 +297,12 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         }
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
     };
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
+    switch (problem.k) {
+    case 6144: return resolve_from(kK6144Routes);
+    case 12288: return resolve_from(kK12288Routes);
+    case 17408: return resolve_from(kK17408Routes);
+    default: return resolve_from(kK4096Routes);
+    }
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,

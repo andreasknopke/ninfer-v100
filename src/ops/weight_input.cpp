@@ -221,7 +221,11 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
         require(result.weight.qtype == QType::BF16, "GDN control requires BF16 weights");
         return result;
     }
-    require(shape[0] == 48, "GDN control: this geometry requires a combined parent");
+    // A/B that are not adjacent in one parent arrive as a pair. Both the 48-row Qwen3.5 control
+    // and the 32-row SenseNova-Loop-9B control have a paired route in gdn_norm_gating_proj; the
+    // row count only decides which kernel the plan resolves.
+    require(shape[0] == 48 || shape[0] == 32,
+            "GDN control: this geometry requires a combined parent");
     const auto first  = prepare_linear_weight(a);
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,

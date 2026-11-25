@@ -31,7 +31,7 @@ MAX_PENDING_REQUESTS="${MAX_PENDING_REQUESTS:-16}"
 PENDING_TIMEOUT_MS="${PENDING_TIMEOUT_MS:-600000}"
 
 NINFER_DIR="${NINFER_DIR:-/home/andre/ninfer-sensenova}"
-MODEL="${NINFER_MODEL:-$NINFER_DIR/../models/sensenova-loop-9b-bf16.ninfer}"
+MODEL="${NINFER_MODEL:-$NINFER_DIR/../models/sensenova-loop-9b-q45.ninfer}"
 MODEL="$(realpath -m "$MODEL")"
 
 BIN="$NINFER_DIR/build-v100/apps/ninfer-serve"

@@ -32,6 +32,15 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
+// SenseNova-Loop-9B's gate/up: 24576 rows over a 4096 hidden, halved to a 12288 intermediate.
+constexpr Q4LinearSwiGluProblem kLoop9bShape{24576, 12288, 4096, 4096, 1};
+
+constexpr bool is_loop_9b_shape(const Q4LinearSwiGluProblem& problem) noexcept {
+    return problem.gate_up_rows == kLoop9bShape.gate_up_rows &&
+           problem.output_rows == kLoop9bShape.output_rows && problem.k == kLoop9bShape.k &&
+           problem.padded_k == kLoop9bShape.padded_k;
+}
+
 constexpr std::array<RouteSpec, 5> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     // Re-measured 2026-09-11 on an RTX 3090 under Linux after the small-T MMA's rewrite (padded code
@@ -128,6 +137,7 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q4LinearSwiGluProblem& problem) noexcept {
+    if (is_loop_9b_shape(problem)) { return true; }
     return problem.gate_up_rows == kShape.gate_up_rows &&
            problem.output_rows == kShape.output_rows && problem.k == kShape.k &&
            problem.padded_k == kShape.padded_k;
@@ -183,6 +193,16 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
     if (!q4_linear_swiglu_admits(problem)) {
         throw std::invalid_argument(
             "q4 linear_swiglu: exact problem or column count is not admitted");
+    }
+
+    // The loop's gate/up has no measured route table: every MMA schedule in kRoutes is tuned to the
+    // 34816-row 27B weight, and on sm_70 the MMA tiles are compute-bound under the emulated
+    // mma.sync anyway. Materialized is the one route whose kernels take rows and k at run time, so
+    // it is the route for this shape at every width.
+    if (is_loop_9b_shape(problem)) {
+        return Q4LinearSwiGluPlan{
+            Q4LinearSwiGluScheduleId::Materialized,
+            materialized_workspace_bytes(problem.gate_up_rows, problem.cols)};
     }
 
     for (const RouteSpec& route : kRoutes) {
