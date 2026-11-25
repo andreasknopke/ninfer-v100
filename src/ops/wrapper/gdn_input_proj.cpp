@@ -749,19 +749,22 @@ namespace {
 // Shared shape checks for the split form, which both overloads owe their callers.
 void require_split_profile(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                            Tensor& qkv, Tensor& z) {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQkRows     = 4096;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
-    constexpr std::int32_t kParentRows = kValueRows + kZRows;
-    const std::int32_t cols            = x.ne[1];
+    const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(qkv, kQkvRows, cols, "qkv");
-    require_matrix(z, kZRows, cols, "z");
+    // The two registered split profiles. Qwen3.5-27B streams 6144 value rows and 6144 z rows over
+    // a 5120 hidden; SenseNova-Loop-9B streams 4096 of each over a 4096 hidden. Both keep the same
+    // 4096-row query/key parent, so only the value half moves with the hidden width.
+    const std::int32_t hidden     = x.ne[0];
+    const std::int32_t value_rows = hidden == 5120 ? 6144 : hidden == 4096 ? 4096 : 0;
+    if (value_rows == 0) {
+        throw std::invalid_argument("gdn_input_proj: unsupported split hidden width");
+    }
+    constexpr std::int32_t kQkRows = 4096;
+    require_matrix(x, hidden, cols, "x");
+    require_matrix(qkv, kQkRows + value_rows, cols, "qkv");
+    require_matrix(z, value_rows, cols, "z");
     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, 2 * value_rows, "value/z weight");
 }
 
 bool t2_two_parent(const Weight& qk_weight, const Weight& value_z_weight) {
@@ -898,9 +901,11 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
         reject_scout_a4(policy);
         return t2_two_parent_projection_bytes(min_tokens, max_tokens, policy);
     }
-    const bool registered = qk_qtype == QType::Q4_G64_FP16 && qk_rows == 4096 &&
-                            value_z_qtype == QType::Q5_G64_FP16 && value_z_rows == 12288 &&
-                            input_rows == 5120;
+    const bool q4_q5_pair =
+        qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16 && qk_rows == 4096;
+    const bool registered =
+        q4_q5_pair && ((value_z_rows == 12288 && input_rows == 5120) ||   // Qwen3.5-27B
+                       (value_z_rows == 8192 && input_rows == 4096));     // SenseNova-Loop-9B
     if (!allows_a8_int(policy) || !registered) { return 0; }
     const std::size_t a8 =
         detail::q4_q5_gdn_input_a8_workspace_capacity_bytes(min_tokens, max_tokens);
@@ -919,22 +924,22 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQkRows     = 4096;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
-    constexpr std::int32_t kParentRows = kValueRows + kZRows;
-    const std::int32_t cols            = x.ne[1];
+    const std::int32_t hidden     = x.ne[0];
+    const std::int32_t value_rows = hidden == 5120 ? 6144 : hidden == 4096 ? 4096 : 0;
+    if (value_rows == 0) {
+        throw std::invalid_argument("gdn_input_proj: unsupported split hidden width");
+    }
+    constexpr std::int32_t kQkRows = 4096;
+    const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(qkv, kQkvRows, cols, "qkv");
-    require_matrix(z, kZRows, cols, "z");
+    require_matrix(x, hidden, cols, "x");
+    require_matrix(qkv, kQkRows + value_rows, cols, "qkv");
+    require_matrix(z, value_rows, cols, "z");
     if (t2_two_parent(qk_weight, value_z_weight)) {
         throw std::invalid_argument("gdn_input_proj: the T2 pair needs the workspace overload");
     }
     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, 2 * value_rows, "value/z weight");
 
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }

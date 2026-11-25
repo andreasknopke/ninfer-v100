@@ -216,8 +216,18 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
 
 bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
-           problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
+    // Qwen3.5-27B: hidden 5120, query/key 4096, value/z 12288 (value 6144 + z 6144).
+    if (problem.input_rows == 5120 && problem.qk_rows == 4096 &&
+        problem.value_z_rows == 12288 && problem.qkv_rows == 10240 && problem.z_rows == 6144 &&
+        problem.padded_k == 5120) {
+        return true;
+    }
+    // SenseNova-Loop-9B: hidden 4096, query/key 4096 (key 2048 + query 2048), value/z 8192
+    // (value 4096 + z 4096). The same 32 value heads of 128 over a narrower hidden, so the row
+    // split is identical and only the widths move.
+    return problem.input_rows == 4096 && problem.qk_rows == 4096 &&
+           problem.value_z_rows == 8192 && problem.qkv_rows == 8192 && problem.z_rows == 4096 &&
+           problem.padded_k == 4096;
 }
 
 } // namespace

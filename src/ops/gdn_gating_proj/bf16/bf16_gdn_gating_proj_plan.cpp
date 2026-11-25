@@ -55,6 +55,15 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{3905, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
+// SenseNova-Loop-9B (32 heads x 4096 rows). The MMA family that the two tables above prefer needs
+// bf16 tensor cores, which sm_70 does not have, and the 27B small-T kernels are instantiated for
+// their own geometries only. So this geometry is served exclusively by the SIMT warp-row kernels,
+// which do the whole product in FP32 with FFMA and need no residency budget at all.
+constexpr std::array<RouteSpec, 2> kSnRoutes{{
+    {{1, 4}, Bf16GdnGatingScheduleId::SimtWarpRowC4},
+    {{5, kAnyCols}, Bf16GdnGatingScheduleId::SimtWarpRowC8},
+}};
+
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
                                  std::int32_t last) noexcept {
@@ -68,6 +77,7 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
+static_assert(catalog_is_closed(kSnRoutes, kAnyCols));
 
 // Per-SM resident-CTA occupancy, measured on the sm_86 build with cuobjdump -res-usage. These are
 // the single source of truth: both the runtime residency predicates and the compile-time catalog
@@ -184,6 +194,11 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
 
+// SenseNova-Loop-9B: 32 value heads over hidden 4096.
+bool is_sn(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 32 && problem.input_rows == 4096;
+}
+
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
@@ -282,6 +297,21 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
         }
     }
 
+    if (is_sn(problem)) {
+        // sm_70 has no bf16 tensor core and the cooperative split-K launches need one, so only the
+        // two SIMT warp-row schedules are admissible here. They launch no more than
+        // 2*heads*ceil(T/ColsPerTile) CTAs and never use a cooperative launch, so sm_count does
+        // not constrain them.
+        switch (schedule) {
+        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+            return problem.cols <= 4 * 65'535;
+        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+            return problem.cols <= 8 * 65'535;
+        default:
+            return false;
+        }
+    }
+
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return problem.cols <= 4 * 65'535;
@@ -352,12 +382,22 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                     execution.stream);
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-        bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               execution.stream);
+        if (is_sn(problem)) {
+            bf16_gdn_gating_proj_sn_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                    execution.stream);
+        } else {
+            bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                    execution.stream);
+        }
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               execution.stream);
+        if (is_sn(problem)) {
+            bf16_gdn_gating_proj_sn_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                    execution.stream);
+        } else {
+            bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                    execution.stream);
+        }
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
         finish_cooperative(bf16_gdn_gating_proj_35_mma_split32_launch(
@@ -465,7 +505,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_sn(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -522,8 +562,9 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
-    return is_27(problem) ? resolve_from_routes(k27Routes, problem, sm_count)
-                          : resolve_from_routes(k35Routes, problem, sm_count);
+    if (is_27(problem)) { return resolve_from_routes(k27Routes, problem, sm_count); }
+    if (is_sn(problem)) { return resolve_from_routes(kSnRoutes, problem, sm_count); }
+    return resolve_from_routes(k35Routes, problem, sm_count);
 }
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,

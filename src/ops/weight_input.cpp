@@ -158,7 +158,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
         require(supported, "input projection: unsupported single-parent format");
         return result;
     }
-    require(dense, "input projection: unsupported multi-parent geometry");
+    require(dense || sensenova, "input projection: unsupported multi-parent geometry");
     const auto first  = single(inputs.first<2>());
     const auto second = single(inputs.last<2>());
     const bool q4_q5 =

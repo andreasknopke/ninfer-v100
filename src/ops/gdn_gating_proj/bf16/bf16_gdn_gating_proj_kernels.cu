@@ -36,6 +36,12 @@ constexpr int k35N           = 32;
 constexpr int k35K           = 2048;
 constexpr int k35LogicalRows = 2 * k35N;
 
+// SenseNova-Loop-9B: the same 32 value heads as the 35B geometry over a 4096-wide hidden, so only
+// the row width differs.
+constexpr int kSnN           = 32;
+constexpr int kSnK           = 4096;
+constexpr int kSnLogicalRows = 2 * kSnN;
+
 template <int TokenTile, int KSlice, int RowsPerBlock>
 __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
@@ -178,8 +184,11 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
     }
 }
 
-template <int ColsPerTile>
-__global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restrict__ x,
+// One warp per (logical row, column tile). Every product is a bf16 pair unpacked to float and
+// accumulated with FFMA, so this kernel needs no bf16 arithmetic and no tensor core: it is the
+// route available on sm_70, where bf16 MMA does not exist.
+template <int Heads, int Rows, int ColsPerTile>
+__global__ void bf16_gdn_gating_proj_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                                     const __nv_bfloat16* __restrict__ a_weight,
                                                     const __nv_bfloat16* __restrict__ b_weight,
                                                     const float* __restrict__ A_log,
@@ -187,20 +196,21 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
                                                     float* __restrict__ g, float* __restrict__ beta,
                                                     std::int32_t t) {
     static_assert(ColsPerTile == 4 || ColsPerTile == 8);
+    static_assert(Rows % 8 == 0, "the vectorised load reads eight bf16 per lane");
     const int lane        = static_cast<int>(threadIdx.x);
     const int logical_row = static_cast<int>(blockIdx.x);
-    const bool is_b       = logical_row >= k35N;
-    const int row         = is_b ? logical_row - k35N : logical_row;
+    const bool is_b       = logical_row >= Heads;
+    const int row         = is_b ? logical_row - Heads : logical_row;
     const int col0        = static_cast<int>(blockIdx.y) * ColsPerTile;
     const int ncols       = min(ColsPerTile, t - col0);
     const auto* weight    = is_b ? b_weight : a_weight;
-    const auto* wrow      = weight + static_cast<std::int64_t>(row) * k35K;
+    const auto* wrow      = weight + static_cast<std::int64_t>(row) * Rows;
 
     float acc[ColsPerTile];
 #pragma unroll
     for (int col = 0; col < ColsPerTile; ++col) { acc[col] = 0.0f; }
 
-    constexpr int kVecs = k35K / 8;
+    constexpr int kVecs = Rows / 8;
     for (int vec = lane; vec < kVecs; vec += 32) {
         const uint4 wv   = load_vec<uint4>(wrow + vec * 8);
         const float2 wf0 = bf16x2_bits_to_float2(wv.x);
@@ -211,7 +221,7 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
         for (int col = 0; col < ColsPerTile; ++col) {
             if (col < ncols) {
                 const uint4 xv =
-                    load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * k35K + vec * 8);
+                    load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * Rows + vec * 8);
                 const float2 xf0 = bf16x2_bits_to_float2(xv.x);
                 const float2 xf1 = bf16x2_bits_to_float2(xv.y);
                 const float2 xf2 = bf16x2_bits_to_float2(xv.z);
@@ -233,7 +243,7 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
         if (col < ncols) {
             const float sum = warp_reduce_sum(acc[col]);
             if (lane == 0) {
-                const std::int64_t out_index = static_cast<std::int64_t>(col0 + col) * k35N + row;
+                const std::int64_t out_index = static_cast<std::int64_t>(col0 + col) * Heads + row;
                 if (is_b) {
                     beta[out_index] = sigmoid(sum);
                 } else {
@@ -255,6 +265,13 @@ void require_shape35(const Weight& w, const char* name) {
     if (w.n != k35N || w.k != k35K || w.shape[0] != k35N || w.shape[1] != k35K) {
         throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
                                     " requires contiguous BF16 [32,2048]");
+    }
+}
+
+void require_shape_sn(const Weight& w, const char* name) {
+    if (w.n != kSnN || w.k != kSnK || w.shape[0] != kSnN || w.shape[1] != kSnK) {
+        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
+                                    " requires contiguous BF16 [32,4096]");
     }
 }
 
@@ -506,15 +523,15 @@ void bf16_gdn_gating_proj_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, 
                                                            nullptr, g, beta, stream);
 }
 
-template <int ColsPerTile>
-void launch_35_simt(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
-                    const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
-                    cudaStream_t stream) {
-    require_shape35(a_weight, "a_weight");
-    require_shape35(b_weight, "b_weight");
-    const dim3 grid(static_cast<unsigned>(k35LogicalRows),
+template <int Heads, int Rows, int LogicalRows, int ColsPerTile>
+void launch_simt(void (*require_weight)(const Weight&, const char*), const Tensor& x,
+                  const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                  const Tensor& dt_bias, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    require_weight(a_weight, "a_weight");
+    require_weight(b_weight, "b_weight");
+    const dim3 grid(static_cast<unsigned>(LogicalRows),
                     static_cast<unsigned>(div_up(x.ne[1], ColsPerTile)), 1u);
-    bf16_gdn_gating_proj_35_simt_kernel<ColsPerTile><<<grid, 32, 0, stream>>>(
+    bf16_gdn_gating_proj_simt_kernel<Heads, Rows, ColsPerTile><<<grid, 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(a_weight.qdata),
         static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
@@ -527,14 +544,32 @@ void bf16_gdn_gating_proj_35_simt_c4_launch(const Tensor& x, const Weight& a_wei
                                             const Weight& b_weight, const Tensor& A_log,
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
-    launch_35_simt<4>(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
+    launch_simt<k35N, k35K, k35LogicalRows, 4>(require_shape35, x, a_weight, b_weight, A_log,
+                                                dt_bias, g, beta, stream);
 }
 
 void bf16_gdn_gating_proj_35_simt_c8_launch(const Tensor& x, const Weight& a_weight,
                                             const Weight& b_weight, const Tensor& A_log,
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
-    launch_35_simt<8>(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
+    launch_simt<k35N, k35K, k35LogicalRows, 8>(require_shape35, x, a_weight, b_weight, A_log,
+                                                dt_bias, g, beta, stream);
+}
+
+void bf16_gdn_gating_proj_sn_simt_c4_launch(const Tensor& x, const Weight& a_weight,
+                                            const Weight& b_weight, const Tensor& A_log,
+                                            const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream) {
+    launch_simt<kSnN, kSnK, kSnLogicalRows, 4>(require_shape_sn, x, a_weight, b_weight, A_log,
+                                                dt_bias, g, beta, stream);
+}
+
+void bf16_gdn_gating_proj_sn_simt_c8_launch(const Tensor& x, const Weight& a_weight,
+                                            const Weight& b_weight, const Tensor& A_log,
+                                            const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream) {
+    launch_simt<kSnN, kSnK, kSnLogicalRows, 8>(require_shape_sn, x, a_weight, b_weight, A_log,
+                                                dt_bias, g, beta, stream);
 }
 
 bool bf16_gdn_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
