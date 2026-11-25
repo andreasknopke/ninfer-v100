@@ -271,17 +271,28 @@ void test_router(int hidden, int T, float w_sigma, int iters, cudaStream_t strea
               ", branch " + std::to_string(be) + ")");
     std::printf("%s: worst error / bound: post %.3f mix %.3f branch %.3f\n", label.c_str(), pe, me, be);
 
-    // A converged mix is doubly stochastic (a property of the result, not a restatement of the code).
+    // A converged mix is doubly stochastic, but only as far as the iteration budget actually
+    // converges: a badly scaled matrix needs more Sinkhorn steps than the release asks for, and then
+    // the FP64 reference is not doubly stochastic either (H=40 T=2 lands at 3.2e-4 after 20 steps).
+    // What the op has to guarantee is that it is no further from doubly stochastic than the
+    // reference is, with room for FP32 rounding on top.
     if (iters >= 8) {
         for (int c = 0; c < T; ++c) {
             for (int i = 0; i < kS; ++i) {
-                double row = 0, column = 0;
+                double row = 0, column = 0, ref_row = 0, ref_column = 0;
                 for (int j = 0; j < kS; ++j) {
-                    row += got.mix[static_cast<std::size_t>(c) * kS * kS + i * kS + j];
-                    column += got.mix[static_cast<std::size_t>(c) * kS * kS + j * kS + i];
+                    const std::size_t base = static_cast<std::size_t>(c) * kS * kS;
+                    row += got.mix[base + i * kS + j];
+                    column += got.mix[base + j * kS + i];
+                    ref_row += ref.mix[base + i * kS + j];
+                    ref_column += ref.mix[base + j * kS + i];
                 }
-                check(std::fabs(row - 1.0) < 1e-4 && std::fabs(column - 1.0) < 1e-4,
-                      label + ": mix row and column " + std::to_string(i) + " sum to 1");
+                const double got_dev = std::max(std::fabs(row - 1.0), std::fabs(column - 1.0));
+                const double ref_dev = std::max(std::fabs(ref_row - 1.0), std::fabs(ref_column - 1.0));
+                check(got_dev <= ref_dev + 1e-6,
+                      label + ": mix row and column " + std::to_string(i) +
+                          " are no less doubly stochastic than the reference (got " +
+                          std::to_string(got_dev) + ", reference " + std::to_string(ref_dev) + ")");
             }
         }
     }

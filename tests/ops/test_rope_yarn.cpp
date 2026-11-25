@@ -354,7 +354,8 @@ int run_single_matches_pair(DeviceExecutionView execution) {
 }
 
 // With factor 1 the blend is the base frequency and the attention factor is 1, so YaRN must reduce
-// to the unscaled op exactly. This pins the rotation, the layout and the axis assignment to rope.h.
+// to the unscaled op. This pins the rotation, the layout and the axis assignment to rope.h: the two
+// may differ only by the precision of their sincos, not by what they rotate or where.
 int run_factor_one_matches_plain_rope(DeviceExecutionView execution) {
     int failures = 0;
     for (int axes : {1, 3}) {
@@ -393,7 +394,9 @@ int run_factor_one_matches_plain_rope(DeviceExecutionView execution) {
             cuda_synchronize();
 
             const auto compare = [&](const GuardedDeviceBuffer& yarn_side,
-                                     const GuardedDeviceBuffer& plain_side, const char* label) {
+                                     const GuardedDeviceBuffer& plain_side,
+                                     const std::vector<float>& input, int heads,
+                                     const char* label) {
                 std::vector<std::uint16_t> x(yarn_side.bytes() / sizeof(std::uint16_t));
                 std::vector<std::uint16_t> y(plain_side.bytes() / sizeof(std::uint16_t));
                 cuda_check(cudaMemcpy(x.data(), yarn_side.data(), yarn_side.bytes(),
@@ -402,15 +405,54 @@ int run_factor_one_matches_plain_rope(DeviceExecutionView execution) {
                 cuda_check(cudaMemcpy(y.data(), plain_side.data(), plain_side.bytes(),
                                       cudaMemcpyDeviceToHost),
                            "copy back y");
-                if (x != y) {
-                    std::cerr << "factor 1 vs plain rope: " << label << " differs ("
-                              << geometry.label << ", T=" << tokens << ")\n";
+                // The two do not take the same precision path: YaRN derives its cos/sin in FP64 and
+                // the plain op uses the FP32 kernel helper, so bit-for-bit equality is not
+                // achievable. The house profile is also the wrong yardstick here: it bounds one op
+                // against exact math, whereas this compares two ops that are each up to one BF16
+                // rounding away from exact math. A rotation preserves the norm of its input pair and
+                // each member is at most that norm, so the widest pair-normalised gap two BF16
+                // roundings can open is one unit in the last place, 2^-7. Anything larger pins a
+                // real difference in rotation, layout or axis assignment.
+                constexpr double kMaxPairGap = 1.0 / 128.0;  // one BF16 unit in the last place
+                const int half = geometry.rotary_dim / 2;
+                double worst = 0.0;
+                int violations = 0;
+                for (int token = 0; token < geometry.tokens; ++token) {
+                    for (int head = 0; head < heads; ++head) {
+                        for (int pair = 0; pair < half; ++pair) {
+                            const double pair_norm = std::hypot(
+                                static_cast<double>(input[dense_index(heads, token, head, pair)]),
+                                static_cast<double>(
+                                    input[dense_index(heads, token, head, pair + half)]));
+                            for (int member = 0; member < 2; ++member) {
+                                const int dim = member == 0 ? pair : pair + half;
+                                const std::size_t index =
+                                    dense_index(heads, token, head, dim);
+                                const double a = bf16_to_f32(x[index]);
+                                const double b = bf16_to_f32(y[index]);
+                                if (!std::isfinite(a) || !std::isfinite(b)) {
+                                    std::cerr << "factor 1 " << label
+                                              << ": non-finite output at index=" << index << '\n';
+                                    return 1;
+                                }
+                                if (pair_norm == 0.0) { continue; }
+                                const double gap = std::abs(a - b) / pair_norm;
+                                worst = std::max(worst, gap);
+                                if (gap > kMaxPairGap) { ++violations; }
+                            }
+                        }
+                    }
+                }
+                if (violations != 0) {
+                    std::cerr << "factor 1 " << label << ": " << violations
+                              << " violations, worst pair gap=" << worst << " (bound "
+                              << kMaxPairGap << ", " << geometry.label << ", T=" << tokens << ")\n";
                     return 1;
                 }
                 return 0;
             };
-            failures += compare(qa, qb, "q");
-            failures += compare(ka, kb, "k");
+            failures += compare(qa, qb, q, q_heads, "q");
+            failures += compare(ka, kb, k, k_heads, "k");
         }
     }
     return failures;
