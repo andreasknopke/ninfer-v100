@@ -14,12 +14,14 @@ struct ShapeEntry {
 constexpr std::array kShapes{
     ShapeEntry{1024, 5120, select_q4_n1024_k5120},
     ShapeEntry{4096, 5120, select_q4_n4096_k5120},
+    ShapeEntry{4096, 12288, select_q4_n4096_k12288},
     ShapeEntry{5120, 4096, select_q4_n5120_k4096},
     ShapeEntry{5120, 6144, select_q4_n5120_k6144},
     ShapeEntry{5120, 17408, select_q4_n5120_k17408},
     ShapeEntry{5120, 25600, select_q4_n5120_k25600},
     ShapeEntry{6144, 5120, select_q4_n6144_k5120},
     ShapeEntry{7168, 5120, select_q4_n7168_k5120},
+    ShapeEntry{24576, 4096, select_q4_n24576_k4096},
     ShapeEntry{34816, 5120, select_q4_n34816_k5120},
     ShapeEntry{131072, 5120, select_q4_n131072_k5120},
     ShapeEntry{131072, 2048, select_q4_n131072_k2048},
@@ -41,6 +43,12 @@ namespace {
 Q4Launch volta_decode_launch(std::int32_t n, std::int32_t k) {
     if (k == 5120 && (n == 4096 || n == 6144 || n == 7168)) return launch_q4_a16_gemv_r1_w8_direct;
     if (k == 6144 && n == 5120) return launch_q4_a16_gemv_r1_w8_k6144;
+    // SenseNova-Loop-9B's MLP down projection: the 12288-wide intermediate back to a 4096
+    // hidden. It has a GEMV instance now, so it does not pay for the emulated mma.
+    if (k == 12288 && n == 4096) return launch_q4_a16_gemv_r1_w16_k12288;
+    // The same model's rotated dense MLP runs the fused gate/up through the plain linear op, and
+    // every projection shares its 4096 hidden, so one route covers them all.
+    if (k == 4096) return launch_q4_a16_gemv_r1_w8_k4096;
     return nullptr;
 }
 } // namespace
@@ -56,7 +64,8 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("q4 linear: unsupported shape");
+    throw std::invalid_argument("q4 linear: unsupported shape n=" + std::to_string(n) +
+                                " k=" + std::to_string(k) + " t=" + std::to_string(t));
 }
 
 Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

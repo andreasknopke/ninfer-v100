@@ -17,4 +17,14 @@ void launch_q4_a16_gemv_r1_w8_k6144(const Tensor& x, const Weight& w, Tensor& ou
     launch_q4_a16_gemv_instance<q4_instances::GemvR1W8K6144>(x, w, out, stream);
 }
 
+void launch_q4_a16_gemv_r1_w16_k12288(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    launch_q4_a16_gemv_instance<q4_instances::GemvR1W16K12288>(x, w, out, stream);
+}
+
+void launch_q4_a16_gemv_r1_w8_k4096(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream) {
+    launch_q4_a16_gemv_instance<q4_instances::GemvR1W8K4096>(x, w, out, stream);
+}
+
 } // namespace ninfer::ops::detail

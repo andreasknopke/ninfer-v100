@@ -7,6 +7,12 @@ namespace ninfer::ops::detail {
 using Q4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q4_a16_gemv_r1_w8_direct(const Tensor& x, const Weight& weight, Tensor& out,
                                      cudaStream_t stream);
+void launch_q4_a16_gemv_r1_w16_k12288(const Tensor& x, const Weight& weight, Tensor& out,
+                                     cudaStream_t stream);
+void launch_q4_a16_gemv_r1_w8_k4096(const Tensor& x, const Weight& weight, Tensor& out,
+                                    cudaStream_t stream);
+
+
 void launch_q4_a16_gemv_r1_w8_k6144(const Tensor& x, const Weight& weight, Tensor& out,
                                     cudaStream_t stream);
 void launch_q4_a16_gemv_r4_w1_direct(const Tensor& x, const Weight& weight, Tensor& out,
