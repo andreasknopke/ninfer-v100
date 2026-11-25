@@ -19,14 +19,24 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kSplitRow = 6144;
-constexpr std::int32_t kHidden   = 5120;
+// The 27B's attention input is 6144 query rows plus 1024 key/value rows over a 5120 hidden.
+// SenseNova-Loop-9B fuses query and gate into one 8192-row projection, so each of its parents is
+// 4096 query rows plus 1024 key/value rows over a 4096 hidden. Every route is written once and
+// instantiated for both profiles, because the geometry reaches the kernels as template arguments.
+template <std::int32_t kHidden> struct gemv_q4_for;
+template <> struct gemv_q4_for<5120> { using type = q4_instances::GemvR1W8K5120; };
+template <> struct gemv_q4_for<4096> { using type = q4_instances::GemvR1W8K4096; };
+template <std::int32_t kHidden> struct gemv_q5_for;
+template <> struct gemv_q5_for<5120> { using type = q5_instances::GemvR16W1G16S2XK5120; };
+template <> struct gemv_q5_for<4096> { using type = q5_instances::GemvR16W1G16S2XK4096; };
+
+template <std::int32_t kHidden, std::int32_t kSplitRow> struct attn_routes {
 
 using Q4AttnSimtR8T4Schedule = Q4A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
-void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+static void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                     cudaStream_t stream) {
-    launch_q4_a16_gemv<q4_instances::GemvR1W8K5120>(
+    launch_q4_a16_gemv<typename gemv_q4_for<kHidden>::type>(
         q4_linear_operands(x, weight),
         LinearBf16SplitOutput2<kSplitRow>{
             {static_cast<__nv_bfloat16*>(q.data),
@@ -37,7 +47,7 @@ void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ke
 }
 
 template <class Schedule>
-void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+static void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                     cudaStream_t stream) {
     launch_q4_a16_simt<Schedule>(
         q4_linear_operands(x, weight),
@@ -50,7 +60,7 @@ void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ke
 }
 
 template <std::int32_t Capacity>
-void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+static void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                             cudaStream_t stream) {
     using Schedule = Q4A16SlicedKMmaSchedule<16, (Capacity + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
                                              6, kHidden, Capacity>;
@@ -64,7 +74,7 @@ void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& q, Te
         LinearIdentityEpilogue{}, stream);
 }
 
-void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+static void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
                            cudaStream_t stream) {
     if (weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("attention Q4 K-split requires padded K == hidden");
@@ -93,7 +103,7 @@ void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& q, Ten
     }
 }
 
-void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream) {
+static void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cudaStream_t stream) {
     switch (x.ne[1]) {
     case 1:
         launch_q4_gemv(x, weight, q, key, stream);
@@ -125,7 +135,7 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
     }
 }
 
-auto q5_projection_output(Tensor& first, Tensor& second) {
+static auto q5_projection_output(Tensor& first, Tensor& second) {
     return LinearBf16SplitOutput2<kSplitRow>{{static_cast<__nv_bfloat16*>(first.data),
                                               std::int64_t(first.nb[1] / sizeof(__nv_bfloat16)), 0},
                                              {static_cast<__nv_bfloat16*>(second.data),
@@ -133,15 +143,15 @@ auto q5_projection_output(Tensor& first, Tensor& second) {
                                               0}};
 }
 
-void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+static void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                     cudaStream_t stream) {
-    launch_q5_a16_gemv<q5_instances::GemvR16W1G16S2XK5120>(q5_linear_operands(x, weight),
+    launch_q5_a16_gemv<typename gemv_q5_for<kHidden>::type>(q5_linear_operands(x, weight),
                                                            q5_projection_output(gate, value),
                                                            LinearIdentityEpilogue{}, stream);
 }
 
 template <int Cols>
-void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+static void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                       cudaStream_t stream) {
     using Schedule = Q5A16DirectSimtSchedule<1, Cols, 4, 4, 10, kHidden, true>;
     launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, weight),
@@ -149,7 +159,7 @@ void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& gate, Tenso
                                         stream);
 }
 
-void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+static void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                             cudaStream_t stream) {
     switch (x.ne[1]) {
     case 2:
@@ -182,14 +192,14 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate,
 }
 
 template <int ColsPerTile>
-void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+static void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                     cudaStream_t stream) {
     using Schedule = Q5A16SimtSchedule<8, ColsPerTile, 1, 16, 2, Cache::ca, 1>;
     launch_q5_a16_simt<Schedule>(q5_linear_operands(x, weight), q5_projection_output(gate, value),
                                  LinearIdentityEpilogue{}, stream);
 }
 
-void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+static void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                cudaStream_t stream) {
     if (x.ne[1] == 1) {
         launch_q5_gemv(x, weight, gate, value, stream);
@@ -214,11 +224,10 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
     throw std::invalid_argument("attention Q5 split-output requires T in [1,12]");
 }
 
-} // namespace
 
-void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
-                                     const Weight& gate_value_weight, Tensor& q, Tensor& gate,
-                                     Tensor& k, Tensor& v, cudaStream_t stream) {
+static void launch(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                     Tensor& v, cudaStream_t stream) {
 #if defined(NINFER_SM70)
     // sm_70: the streaming GEMV serves T = 2..32 (verify widths, short prompts), where the SIMT
     // tiles above ran at
@@ -248,6 +257,20 @@ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_we
 #endif
     launch_q4(x, query_key_weight, q, k, stream);
     launch_q5(x, gate_value_weight, gate, v, stream);
+}
+};
+
+} // namespace
+
+void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
+                                     const Weight& gate_value_weight, Tensor& q, Tensor& gate,
+                                     Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (x.ne[0] == 4096) {
+        attn_routes<4096, 4096>::launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                        stream);
+        return;
+    }
+    attn_routes<5120, 6144>::launch(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -116,8 +116,14 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "attention input routes must be exact and closed");
 
 bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 6144 && problem.kv_rows == 1024 &&
-           problem.padded_k == 5120;
+    if (problem.input_rows == 5120 && problem.query_rows == 6144 && problem.kv_rows == 1024 &&
+        problem.padded_k == 5120) {
+        return true;
+    }
+    // SenseNova-Loop-9B: query and gate share one 8192-row projection, so each parent here carries
+    // 4096 query rows plus 1024 key/value rows over the model's 4096 hidden.
+    return problem.input_rows == 4096 && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
+           problem.padded_k == 4096;
 }
 
 } // namespace
