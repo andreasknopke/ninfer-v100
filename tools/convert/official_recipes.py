@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from . import sensenova_loop
 from .dsv4_model import dsv4_gguf
 from .inkling2_model import inkling2_gguf
 from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
@@ -300,9 +301,14 @@ def sensenova_loop_9b(model, recipe, sources):
     """SenseNova-Loop-9B: the Qwen3.5 dense role split, unchanged.
 
     The routers are not projections, so they keep the `fp32` the converter gave
-    them; only the projections are quantised here.
+    them; only the projections are quantised here. Sharing comes last on purpose:
+    assigning to a shared parameter makes it independent again
+    (`test_shared_weight_keeps_use_independent_and_can_be_overridden`), so sharing
+    before the assignments would be undone by them and the repeated blocks would be
+    quantised twice -- 10 GiB of it, which does not fit the card.
     """
     _dense_groupwise(model, recipe, Q6)
+    sensenova_loop.apply_loop_sharing(model, recipe)
 
 
 def sensenova_loop_9b_bf16(model, recipe, sources):
@@ -310,13 +316,14 @@ def sensenova_loop_9b_bf16(model, recipe, sources):
 
     Larger than the quantised artifact and not a shipping recipe; it exists so a
     first load can be checked against the checkpoint without four-bit error in
-    the way.
+    the way. Shared last, for the reason given above.
     """
     if "num_experts" in model.config:
         raise ValueError("this recipe requires Qwen3.5 Dense mathematics")
     for name, parameter in model.parameters.items():
         if parameter.projection:
             recipe.assign(name, format="bf16", method=cast_direct)
+    sensenova_loop.apply_loop_sharing(model, recipe)
 
 
 RECIPES = {

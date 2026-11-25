@@ -15,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
+from tools.convert import official_recipes
 from tools.convert import sensenova_loop as sn
+from tools.convert.recipe import Recipe
 from tools.convert.sensenova_loop_inventory import is_skipped
 from tools.convert.sources.awq_source import GEMM, ROW_MAJOR, awq_matrix_source
 from tools.convert.sources.safetensors import SafetensorsSource
@@ -39,6 +41,7 @@ def _config() -> dict:
 # --- config translation -----------------------------------------------------
 
 
+@needs_checkpoint
 def test_the_loop_and_router_settings_survive_translation() -> None:
     config = sn.text_config(_config())
     assert config["loop"] == {"start": 4, "end": 28, "passes": 2, "eval_count": 2}
@@ -57,11 +60,22 @@ def test_the_loop_and_router_settings_survive_translation() -> None:
         "original_max_position_embeddings": 262144,
     }
     # The shared Qwen3.5 fields are still validated, not passed through blindly.
-    assert config["num_hidden_layers"] == 32
-    assert config["layer_types"].count("full_attention") == 8
     assert config["rope_parameters"]["rope_theta"] == 10_000_000
+    # The loop is stated as blocks: 56 slots over 32 physical blocks, and the slot
+    # list -- not the physical one -- is what the runtime counts state planes by.
+    assert config["num_hidden_layers"] == 56
+    assert len(config["layer_types"]) == 56
+    assert config["layer_types"].count("full_attention") == 14
+    assert config["physical_layer_types"].count("full_attention") == 8
+    assert sn.slot_order(config["loop"], config["physical_layer_types"]) == (
+        (0, 1, 2, 3)
+        + tuple(range(4, 28))
+        + tuple(range(4, 28))
+        + (28, 29, 30, 31)
+    )
 
 
+@needs_checkpoint
 def test_a_loop_beyond_the_blocks_is_refused() -> None:
     source = _config()
     source["loop_settings"]["end"] = 33
@@ -69,6 +83,7 @@ def test_a_loop_beyond_the_blocks_is_refused() -> None:
         sn.text_config(source)
 
 
+@needs_checkpoint
 def test_a_gated_loop_is_refused_rather_than_ignored() -> None:
     """`loop_gate.logits` exists but `use_gate` is false, so nothing reads it.
 
@@ -81,6 +96,7 @@ def test_a_gated_loop_is_refused_rather_than_ignored() -> None:
         sn.text_config(source)
 
 
+@needs_checkpoint
 def test_routers_outside_the_loop_are_refused() -> None:
     source = _config()
     source["mhc"]["end"] = 30
@@ -88,6 +104,7 @@ def test_routers_outside_the_loop_are_refused() -> None:
         sn.text_config(source)
 
 
+@needs_checkpoint
 def test_unscaled_rope_is_refused() -> None:
     source = _config()
     source["text_config"]["rope_parameters"].pop("factor")
@@ -103,34 +120,105 @@ def test_mhc_routers_are_f32_and_unquantized() -> None:
     with SafetensorsSource(_checkpoint()) as base:
         model = sn.build_model(base)
     routers = [p for p in model.parameters.values() if "/mhc/" in p.name]
-    assert len(routers) == 96
+    # 24 physical blocks carry routers, and each runs twice, so 48 slots declare
+    # them. `apply_loop_sharing` collapses each pair onto one object afterwards.
+    assert len(routers) == 192
     assert all(not p.inputs for p in routers)
     assert all(p.direct_format == "fp32" for p in routers)
     coefficients = [p for p in routers if p.name.endswith("/coefficients")]
     assert {p.shape for p in coefficients} == {(8, 8192)}
 
 
-# --- the artifact carries the release document, not a translation -----------
+# --- the loop is stated as blocks, and the repeats cost no bytes ------------
 
 
 @needs_checkpoint
-def test_the_text_config_is_the_release_document_verbatim() -> None:
-    """What the artifact stores as its text config is the file, unchanged.
+def test_the_artifact_states_the_loop_as_slots() -> None:
+    """The stored config is one the plain Qwen3.5 reader accepts, at 56 blocks.
 
-    `models::sensenova_loop::parse_config` owns this field set on the C++ side and
-    is strict about unknown members. A translation written here would be a second
-    description of the same model, and the first thing to drift out of agreement
-    with that reader.
+    The point of stating the loop as slots is that no engine path has to learn a
+    new concept: the config is a Qwen3.5 text config whose `layer_types` happens to
+    repeat, so the runtime's per-block state planes are already per slot. The
+    physical layout travels alongside it, because weights and routers are still
+    indexed by physical block.
     """
     with SafetensorsSource(_checkpoint()) as base:
         model = sn.build_model(base)
-    assert model.config == json.loads(
-        (Path(_checkpoint()) / "config.json").read_text()
-    )
-    # The two things the runtime dispatches on, restated so a silent change to
-    # either is not buried inside the equality above.
-    assert model.config["model_type"] == "sensenova_loop"
-    assert model.config["architectures"] == [sn.ARCHITECTURE]
+    assert model.config["model_type"] == "qwen3_5_text"
+    assert model.config["architectures"] == ["Qwen3_5ForCausalLM"]
+    assert model.config["num_hidden_layers"] == 56
+    assert len(model.config["physical_layer_types"]) == 32
+    assert model.config["loop"] == {"start": 4, "end": 28, "passes": 2, "eval_count": 2}
+
+
+@needs_checkpoint
+def test_every_repeated_block_shares_its_first_pass() -> None:
+    """No repeated block keeps its own weights.
+
+    This is what keeps the artifact on the card: 24 blocks run twice, and copying
+    them would add roughly 11 GiB to a 17 GiB artifact. `test_recipe.py` proves
+    `share` emits one object for two names; this proves the loop asks for that on
+    every parameter of every repeated block, so nothing is left unshared.
+    """
+    with SafetensorsSource(_checkpoint()) as base:
+        model = sn.build_model(base)
+    recipe = Recipe(model)
+    sn.apply_loop_sharing(model, recipe)
+
+    order = sn.slot_order(model.config["loop"], model.config["physical_layer_types"])
+    first = {}
+    repeated = []
+    for slot, layer in enumerate(order):
+        if layer in first:
+            repeated.append((slot, first[layer]))
+        else:
+            first[layer] = slot
+    assert len(repeated) == 24
+
+    expected = {
+        name
+        for name in model.parameters
+        if any(name.startswith(f"text/layers/{slot}/") for slot, _ in repeated)
+    }
+    assert set(recipe.aliases) == expected
+    for slot, source in repeated:
+        for name in model.parameters:
+            if not name.startswith(f"text/layers/{slot}/"):
+                continue
+            target = recipe.aliases[name]
+            assert target.startswith(f"text/layers/{source}/")
+            assert target[len(f"text/layers/{source}/") :] == name[len(f"text/layers/{slot}/") :]
+    # A shared name never points at another shared name: two hops would mean the
+    # second pass was aimed at a block that itself has no weights.
+    assert not (set(recipe.aliases.values()) & set(recipe.aliases))
+
+
+@needs_checkpoint
+@pytest.mark.parametrize("recipe_name", ["sensenova_loop_9b", "sensenova_loop_9b_bf16"])
+def test_sharing_survives_the_recipe(recipe_name: str) -> None:
+    """The recipe's own assignments must not undo the sharing.
+
+    Assigning a format to a shared parameter makes it independent again -- that is
+    `test_shared_weight_keeps_use_independent_and_can_be_overridden`'s stated
+    behaviour, not a bug. Both recipes quantise by name, so if sharing ran before
+    they did, every repeated block would be quantised a second time and the artifact
+    would grow by roughly 10 GiB. It did exactly that once.
+    """
+    with SafetensorsSource(_checkpoint()) as base:
+        model = sn.build_model(base)
+    recipe = Recipe(model)
+    getattr(official_recipes, recipe_name)(model, recipe, None)
+
+    order = sn.slot_order(model.config["loop"], model.config["physical_layer_types"])
+    repeated = {
+        slot
+        for slot, layer in enumerate(order)
+        if layer in order[:slot]
+    }
+    assert len(repeated) == 24
+    for name in model.parameters:
+        if any(name.startswith(f"text/layers/{slot}/") for slot in repeated):
+            assert name in recipe.aliases, f"{recipe_name} unshared {name}"
 
 
 # --- the layout is determined by the bytes, not chosen by us ----------------

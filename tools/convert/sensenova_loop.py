@@ -7,10 +7,17 @@ differ, and they are the whole reason this module exists.
 First, the release is AWQ-packed. `qwen3_5.matrix_source` reads plain tensors, so
 `_Builder.matrix` below resolves a `{qweight,qzeros,scales}` triple instead.
 
-Second, blocks 4..27 execute twice. The artifact does *not* carry duplicated
-weights: it holds the 32 physical blocks and records the loop settings, and the
-runtime's `ExecutionPlan` maps each of the 56 execution slots onto a physical
-block. Duplicating the weights here would double the artifact for no gain.
+Second, blocks 4..27 execute twice. The artifact states that as 56 blocks rather
+than as a loop the runtime has to expand: `layer_types` lists one entry per
+execution slot, so the runtime's own per-block state planes -- `compact_layer_indices`
+in `qwen3_5/config.cpp`, a running counter per mixer kind -- already number the
+slots apart, which is exactly what `ExecutionPlan::family_index` computes.
+
+The duplicated blocks cost nothing to store. `Recipe.share` puts a second name on
+the *same* object, and `prepare` then emits one weight for both (`test_recipe.py`
+asserts `len(shared.weights) == 1`), so the artifact still holds 32 blocks of
+weights behind 56 block names. Duplicating the bytes instead would add roughly
+11 GiB, which does not fit the 32 GiB card this runs on.
 
 The mHC routers (`mhc_attn`, `mhc_ffn`) are the only parameters Qwen3.5 does not
 have. They are FP32 and unquantized, and they mix the residual streams that the
@@ -75,6 +82,22 @@ def _loop_settings(source: dict, num_layers: int) -> dict:
         "passes": passes,
         "eval_count": _positive(raw.get("eval_count", 1), "loop_settings.eval_count"),
     }
+
+
+def slot_order(loop: dict, physical_layer_types: list[str]) -> tuple[int, ...]:
+    """Which physical block each execution slot runs, in execution order.
+
+    Mirrors `ExecutionPlan`'s constructor in `src/models/sensenova_loop/loop_plan.cpp`
+    exactly: the blocks before the range, then the whole range once per visit, then
+    the blocks after it. The range runs as a block -- `4,5,..,27,4,5,..,27` -- not
+    block-by-block, which is the difference between a loop model and a model that
+    simply repeats a layer.
+    """
+    order = list(range(loop["start"]))
+    for _visit in range(loop["passes"]):
+        order.extend(range(loop["start"], loop["end"]))
+    order.extend(range(loop["end"], len(physical_layer_types)))
+    return tuple(order)
 
 
 def _mhc_settings(source: dict, loop: dict, hidden_size: int) -> dict:
@@ -162,6 +185,15 @@ def text_config(source: dict) -> dict:
     config["loop"] = loop
     config["mhc"] = _mhc_settings(source, loop, config["hidden_size"])
     config["yarn"] = _yarn(source)
+    # State the loop as blocks the runtime already understands. `layer_types` gains
+    # one entry per execution slot, and `num_hidden_layers` counts slots, so the
+    # runtime numbers state planes per slot without knowing a loop exists. The
+    # physical list stays: weights and mHC routers are still indexed by it.
+    physical = list(config["layer_types"])
+    order = slot_order(loop, physical)
+    config["physical_layer_types"] = physical
+    config["layer_types"] = [physical[index] for index in order]
+    config["num_hidden_layers"] = len(order)
     return config
 
 
@@ -243,7 +275,7 @@ def build_model(
     companions: Mapping[str, SafetensorsSource] | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
 ) -> Model:
-    """The text component of the release: 32 physical blocks plus the routers."""
+    """The text component of the release: 56 execution slots over 32 physical blocks."""
     if set(components) != {"text"}:
         raise ValueError(
             "only the text component is supported for "
@@ -254,11 +286,11 @@ def build_model(
             f"expected architectures [{ARCHITECTURE!r}], got {base.config.get('architectures')!r}"
         )
     config = text_config(base.config)
-    # The artifact carries the release document verbatim, not a translation of it.
-    # `models::sensenova_loop::parse_config` owns this field set on the C++ side and
-    # is strict about unknown members, so a translation here would be a second
-    # description of the same model to keep in sync -- and the first thing to drift.
-    records = {"text": {"config": base.config}}
+    # The artifact states the loop as blocks, so the config the runtime reads is the
+    # slot-shaped one `text_config` built, not the release document. The release's
+    # own `loop_settings` and `mhc` still travel inside it, so the physical layout
+    # stays recoverable from the artifact alone.
+    records = {"text": {"config": config}}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"], overrides=resource_overrides
     )
@@ -284,10 +316,38 @@ def build_model(
     builder.add("text/final_norm", base, prefix + "norm.weight", (h,))
 
     mhc = config["mhc"]
-    for index, kind in enumerate(config["layer_types"]):
-        block = f"text/layers/{index}/"
-        source = prefix + f"layers.{index}."
-        builder.block(block, source, base, config, kind)
-        if mhc["start"] <= index < mhc["end"]:
+    physical = config["physical_layer_types"]
+    for slot, layer in enumerate(slot_order(config["loop"], physical)):
+        block = f"text/layers/{slot}/"
+        # A repeated slot reads its block's checkpoint tensors again. `share` below
+        # collapses the two onto one object, so this is a second name, not a copy.
+        source = prefix + f"layers.{layer}."
+        builder.block(block, source, base, config, physical[layer])
+        if mhc["start"] <= layer < mhc["end"]:
             builder.mhc(block, source, base, mhc)
     return model
+
+
+def apply_loop_sharing(model: Model, recipe) -> None:
+    """Put every repeated block's parameters onto the first pass's weights.
+
+    `build_model` declares all 56 slots, so a repeated block has its own parameter
+    names reading the same checkpoint tensors. Sharing them makes `prepare` emit one
+    object for both names, which is what keeps the artifact at 32 blocks of weights
+    behind 56 block names.
+    """
+    order = slot_order(model.config["loop"], model.config["physical_layer_types"])
+    first: dict[int, int] = {}
+    shared = 0
+    for slot, layer in enumerate(order):
+        if layer not in first:
+            first[layer] = slot
+            continue
+        from_prefix = f"text/layers/{slot}/"
+        to_prefix = f"text/layers/{first[layer]}/"
+        for name in model.parameters:
+            if name.startswith(from_prefix):
+                recipe.share(name, to_prefix + name[len(from_prefix) :])
+                shared += 1
+    if not shared:
+        raise ValueError("the loop shares no weights: the looped range is empty")
