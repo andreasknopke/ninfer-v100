@@ -255,7 +255,7 @@ void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_wi
     }
 }
 
-void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
+void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, std::int32_t k, const char* label) {
     const bool no_high   = weight.qhigh == nullptr && weight.high_plane_bytes == 0;
     const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
     const bool t2_planes = qtype != QType::T2_G128_FP16 || no_high;
@@ -265,9 +265,9 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
     if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 ||
         weight.group_size != static_cast<std::uint32_t>(group) || weight.group != group ||
-        !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
-        weight.shape[0] != rows || weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
+        !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != k ||
+        weight.shape[0] != rows || weight.shape[1] != k || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != k || !q4_planes || !q5_planes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
         (qtype == QType::Q5_G64_FP16 && !aligned_to(weight.qhigh, 16))) {
         throw std::invalid_argument(std::string("gdn_input_proj: invalid ") + label);
@@ -763,8 +763,8 @@ void require_split_profile(const Tensor& x, const Weight& qk_weight, const Weigh
     require_matrix(x, hidden, cols, "x");
     require_matrix(qkv, kQkRows + value_rows, cols, "qkv");
     require_matrix(z, value_rows, cols, "z");
-    require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, 2 * value_rows, "value/z weight");
+require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, hidden, "qk weight");
+require_rowsplit(value_z_weight, QType::Q5_G64_FP16, 2 * value_rows, hidden, "value/z weight");
 }
 
 bool t2_two_parent(const Weight& qk_weight, const Weight& value_z_weight) {
@@ -791,8 +791,8 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     require_matrix(x, 5120, cols, "x");
     require_matrix(qkv, kQkvRows, cols, "qkv");
     require_matrix(z, kZRows, cols, "z");
-    require_rowsplit(qk_weight, QType::T2_G128_FP16, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::T2_G128_FP16, kValueRows + kZRows, "value/z weight");
+require_rowsplit(qk_weight, QType::T2_G128_FP16, kQkRows, 5120, "qk weight");
+require_rowsplit(value_z_weight, QType::T2_G128_FP16, kValueRows + kZRows, 5120, "value/z weight");
     auto scope = workspace.scope();
     if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(qk_weight, cols) &&
         detail::t2_a8_supported(value_z_weight, cols)) {
@@ -938,8 +938,8 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     if (t2_two_parent(qk_weight, value_z_weight)) {
         throw std::invalid_argument("gdn_input_proj: the T2 pair needs the workspace overload");
     }
-    require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, 2 * value_rows, "value/z weight");
+require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, hidden, "qk weight");
+require_rowsplit(value_z_weight, QType::Q5_G64_FP16, 2 * value_rows, hidden, "value/z weight");
 
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }
@@ -1181,19 +1181,26 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   cudaStream_t stream) {
     validate_policy(policy);
     reject_scout_a4(policy);
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQueryRows  = 2048;
-    constexpr std::int32_t kKeyRows    = 2048;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
-    constexpr std::int32_t kParentRows = kValueRows + kZRows;
+// Both registered split profiles keep the same 4096-row query/key parent, so only the value
+// half moves with the hidden width: Qwen3.5-27B streams 6144 value and 6144 z rows over a
+// 5120 hidden, SenseNova-Loop-9B 4096 of each over a 4096 hidden. Read the width off x rather
+// than fixing it, the way require_split_profile already does.
+    const std::int32_t kHidden     = x.ne[0];
+    const std::int32_t kQueryRows  = 2048;
+    const std::int32_t kKeyRows    = 2048;
+    const std::int32_t kValueRows  = kHidden == 5120 ? 6144 : kHidden == 4096 ? 4096 : 0;
+    const std::int32_t kZRows      = kValueRows;
+    const std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
+    const std::int32_t kParentRows = kValueRows + kZRows;
+    if (kValueRows == 0) {
+        throw std::invalid_argument("gdn_input_proj: unsupported split hidden width");
+    }
     const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
     const bool ternary                 = t2_two_parent(qk_weight, value_z_weight);
     require_rowsplit(qk_weight, ternary ? QType::T2_G128_FP16 : QType::Q4_G64_FP16,
-                     kQueryRows + kKeyRows, "qk weight");
+                     kQueryRows + kKeyRows, kHidden, "qk weight");
     require_rowsplit(value_z_weight, ternary ? QType::T2_G128_FP16 : QType::Q5_G64_FP16,
-                     kParentRows, "value/z weight");
+                     kParentRows, kHidden, "value/z weight");
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
                               snapshot_base_slots, kChannels, geometry);
     require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
@@ -1254,19 +1261,26 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 cudaStream_t stream) {
     validate_policy(policy);
     reject_scout_a4(policy);
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQueryRows  = 2048;
-    constexpr std::int32_t kKeyRows    = 2048;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
-    constexpr std::int32_t kParentRows = kValueRows + kZRows;
+// Both registered split profiles keep the same 4096-row query/key parent, so only the value
+// half moves with the hidden width: Qwen3.5-27B streams 6144 value and 6144 z rows over a
+// 5120 hidden, SenseNova-Loop-9B 4096 of each over a 4096 hidden. Read the width off x rather
+// than fixing it, the way require_split_profile already does.
+    const std::int32_t kHidden     = x.ne[0];
+    const std::int32_t kQueryRows  = 2048;
+    const std::int32_t kKeyRows    = 2048;
+    const std::int32_t kValueRows  = kHidden == 5120 ? 6144 : kHidden == 4096 ? 4096 : 0;
+    const std::int32_t kZRows      = kValueRows;
+    const std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
+    const std::int32_t kParentRows = kValueRows + kZRows;
+    if (kValueRows == 0) {
+        throw std::invalid_argument("gdn_input_proj: unsupported split hidden width");
+    }
     const ConvGeometry geometry        = require_record_input(x, kHidden);
     const bool ternary                 = t2_two_parent(qk_weight, value_z_weight);
     require_rowsplit(qk_weight, ternary ? QType::T2_G128_FP16 : QType::Q4_G64_FP16,
-                     kQueryRows + kKeyRows, "qk weight");
+                     kQueryRows + kKeyRows, kHidden, "qk weight");
     require_rowsplit(value_z_weight, ternary ? QType::T2_G128_FP16 : QType::Q5_G64_FP16,
-                     kParentRows, "value/z weight");
+                     kParentRows, kHidden, "value/z weight");
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
                             geometry);
     require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
