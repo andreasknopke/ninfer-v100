@@ -254,7 +254,11 @@ def build_model(
             f"expected architectures [{ARCHITECTURE!r}], got {base.config.get('architectures')!r}"
         )
     config = text_config(base.config)
-    records = {"text": {"config": config}}
+    # The artifact carries the release document verbatim, not a translation of it.
+    # `models::sensenova_loop::parse_config` owns this field set on the C++ side and
+    # is strict about unknown members, so a translation here would be a second
+    # description of the same model to keep in sync -- and the first thing to drift.
+    records = {"text": {"config": base.config}}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"], overrides=resource_overrides
     )

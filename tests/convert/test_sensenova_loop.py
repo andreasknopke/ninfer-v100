@@ -110,6 +110,29 @@ def test_mhc_routers_are_f32_and_unquantized() -> None:
     assert {p.shape for p in coefficients} == {(8, 8192)}
 
 
+# --- the artifact carries the release document, not a translation -----------
+
+
+@needs_checkpoint
+def test_the_text_config_is_the_release_document_verbatim() -> None:
+    """What the artifact stores as its text config is the file, unchanged.
+
+    `models::sensenova_loop::parse_config` owns this field set on the C++ side and
+    is strict about unknown members. A translation written here would be a second
+    description of the same model, and the first thing to drift out of agreement
+    with that reader.
+    """
+    with SafetensorsSource(_checkpoint()) as base:
+        model = sn.build_model(base)
+    assert model.config == json.loads(
+        (Path(_checkpoint()) / "config.json").read_text()
+    )
+    # The two things the runtime dispatches on, restated so a silent change to
+    # either is not buried inside the equality above.
+    assert model.config["model_type"] == "sensenova_loop"
+    assert model.config["architectures"] == [sn.ARCHITECTURE]
+
+
 # --- the layout is determined by the bytes, not chosen by us ----------------
 
 
