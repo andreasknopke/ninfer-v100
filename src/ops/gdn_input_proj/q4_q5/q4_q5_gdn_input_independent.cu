@@ -18,16 +18,24 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
-namespace {
 
-constexpr std::int32_t kValueRows = 6144;
-constexpr std::int32_t kHidden    = 5120;
+// The GEMV schedules carry a static K, so the instance has to follow the profile.
+template <std::int32_t Hidden> struct gemv_q4_for;
+template <> struct gemv_q4_for<5120> { using type = q4_instances::GemvR1W8K5120; };
+template <> struct gemv_q4_for<4096> { using type = q4_instances::GemvR1W8K4096; };
+template <std::int32_t Hidden> struct gemv_q5_for;
+template <> struct gemv_q5_for<5120> { using type = q5_instances::GemvR16W1G16S2XK5120; };
+template <> struct gemv_q5_for<4096> { using type = q5_instances::GemvR16W1G16S2XK4096; };
+// The two registered split profiles differ only in the hidden width and the value row count that
+// follows from it, so the whole route table is written once and instantiated for both.
+template <std::int32_t kHidden, std::int32_t kValueRows>
+struct independent_routes {
 
 using Q4GdnSimtR8T4Schedule = Q4A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 using Q4GdnSimtR8T8Schedule = Q4A16SimtSchedule<8, 8, 1, 16, 2, Cache::ca, 1>;
 
-void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    launch_q4_a16_gemv<q4_instances::GemvR1W8K5120>(
+static void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    launch_q4_a16_gemv<typename gemv_q4_for<kHidden>::type>(
         q4_linear_operands(x, weight),
         LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(out.data),
                                 static_cast<std::int64_t>(out.nb[1] / sizeof(__nv_bfloat16)), 0},
@@ -35,7 +43,7 @@ void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
 }
 
 template <class Schedule>
-void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+static void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     launch_q4_a16_simt<Schedule>(
         q4_linear_operands(x, weight),
         LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(out.data),
@@ -44,7 +52,7 @@ void launch_q4_simt(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
 }
 
 template <std::int32_t Capacity>
-void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& out,
+static void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& out,
                             cudaStream_t stream) {
     using Schedule = Q4A16SlicedKMmaSchedule<16, (Capacity + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
                                              6, kHidden, Capacity>;
@@ -55,7 +63,7 @@ void launch_q4_sliced_exact(const Tensor& x, const Weight& weight, Tensor& out,
         LinearIdentityEpilogue{}, stream);
 }
 
-void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& out,
+static void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& out,
                            cudaStream_t stream) {
     if (weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("Q4/Q5 GDN K-split requires padded K == hidden");
@@ -84,7 +92,7 @@ void launch_q4_sliced_band(const Tensor& x, const Weight& weight, Tensor& out,
     }
 }
 
-void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+static void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     switch (x.ne[1]) {
     case 1:
         launch_q4_gemv(x, weight, out, stream);
@@ -116,7 +124,7 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
     }
 }
 
-auto q5_projection_output(Tensor& first, Tensor& second) {
+static auto q5_projection_output(Tensor& first, Tensor& second) {
     return LinearBf16SplitOutput2<kValueRows>{
         {static_cast<__nv_bfloat16*>(first.data), std::int64_t(first.nb[1] / sizeof(__nv_bfloat16)),
          0},
@@ -132,17 +140,17 @@ auto q5_projection_output(Tensor& first, Tensor& second) {
 // gone. Numbers and method are in q4_q5_gdn_input_plan.cpp; the reason 9 collapses is on
 // launch_q5_split4_exact below. simt_r8_c8 keeps widths 9..15, which the route table does not
 // reach but the schedule bench does.
-constexpr std::int32_t kQ5Split4LastCols = 8;
+static constexpr std::int32_t kQ5Split4LastCols = 8;
 
-void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+static void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                     cudaStream_t stream) {
-    launch_q5_a16_gemv<q5_instances::GemvR16W1G16S2XK5120>(q5_linear_operands(x, weight),
+    launch_q5_a16_gemv<typename gemv_q5_for<kHidden>::type>(q5_linear_operands(x, weight),
                                                            q5_projection_output(value, z),
                                                            LinearIdentityEpilogue{}, stream);
 }
 
 template <int Cols>
-void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+static void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                       cudaStream_t stream) {
     using Schedule = Q5A16DirectSimtSchedule<1, Cols, 4, 4, 10, kHidden, true>;
     launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, weight),
@@ -169,7 +177,7 @@ void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tens
 // budget rather than the shared arena -- it carries `__launch_bounds__(128, 10)`, so 51 registers
 // per thread, and `acc[kTt]` costs one register per column; past roughly T=10 expect spills, which
 // will look like a loss for a reason that is not the geometry.
-void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+static void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                             cudaStream_t stream) {
     switch (x.ne[1]) {
     case 2:
@@ -199,14 +207,14 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value
 }
 
 template <int kColsPerTile>
-void launch_q5_simt_cols(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+static void launch_q5_simt_cols(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                          cudaStream_t stream) {
     using Schedule = Q5A16SimtSchedule<8, kColsPerTile, 1, 16, 2, Cache::ca, 1>;
     launch_q5_a16_simt<Schedule>(q5_linear_operands(x, weight), q5_projection_output(value, z),
                                  LinearIdentityEpilogue{}, stream);
 }
 
-void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+static void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                cudaStream_t stream) {
     if (x.ne[1] == 1) {
         launch_q5_gemv(x, weight, value, z, stream);
@@ -231,7 +239,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,15]");
 }
 
-void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+static void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                    Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
     using Q4Schedule = Q4GdnSimtR8T4Schedule;
     using Q5Schedule = Q5A16DirectSimtSchedule<1, 4, 4, 4, 10, kHidden, true>;
@@ -246,44 +254,59 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
         LinearIdentityEpilogue{}, stream);
 }
 
-} // namespace
+    static void launch(const Tensor& x, const Weight& qk_weight,
+                     const Weight& value_z_weight, Tensor& qk, Tensor& value, Tensor& z,
+                     cudaStream_t stream) {
+    #if defined(NINFER_SM70)
+        // sm_70: the streaming GEMV serves T = 2..32 (verify widths, short prompts), where the split4 /
+        // SIMT tiles ran
+        // at 40-50% of the weight stream on a V100 (Qwen3.8-27B MTP3 verify, nsys: 134 + 51 us per call
+        // at T=4).
+        if (x.ne[1] >= 2 && x.ne[1] <= kStreamGemvMaxTokens) {
+            const std::int64_t x_stride = x.nb[1] / sizeof(__nv_bfloat16);
+            const Q4LinearOperands q4   = q4_linear_operands(x, qk_weight);
+            const Q5LinearOperands q5   = q5_linear_operands(x, value_z_weight);
+            if (!try_launch_stream_gemv<Q4StreamFormat>(
+                    q4.x, {q4.codes, q4.scales},
+                    LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(qk.data),
+                                            static_cast<std::int64_t>(qk.nb[1] / sizeof(__nv_bfloat16)),
+                                            0},
+                    LinearIdentityEpilogue{}, q4.rows, q4.k, q4.padded_k, stream, q4.tokens,
+                    x_stride)) {
+                launch_q4(x, qk_weight, qk, stream);
+            }
+            if (!try_launch_stream_gemv<Q5StreamFormat>(
+                    q5.x, {q5.codes, q5.high, q5.scales}, q5_projection_output(value, z),
+                    LinearIdentityEpilogue{}, q5.rows, q5.k, q5.padded_k, stream, q5.tokens,
+                    x_stride)) {
+                launch_q5(x, value_z_weight, value, z, stream);
+            }
+            return;
+        }
+    #endif
+        if (x.ne[1] == 4) {
+            launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
+            return;
+        }
+        launch_q4(x, qk_weight, qk, stream);
+        launch_q5(x, value_z_weight, value, z, stream);
+    }
+};
 
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
-#if defined(NINFER_SM70)
-    // sm_70: the streaming GEMV serves T = 2..32 (verify widths, short prompts), where the split4 /
-    // SIMT tiles ran
-    // at 40-50% of the weight stream on a V100 (Qwen3.8-27B MTP3 verify, nsys: 134 + 51 us per call
-    // at T=4).
-    if (x.ne[1] >= 2 && x.ne[1] <= kStreamGemvMaxTokens) {
-        const std::int64_t x_stride = x.nb[1] / sizeof(__nv_bfloat16);
-        const Q4LinearOperands q4   = q4_linear_operands(x, qk_weight);
-        const Q5LinearOperands q5   = q5_linear_operands(x, value_z_weight);
-        if (!try_launch_stream_gemv<Q4StreamFormat>(
-                q4.x, {q4.codes, q4.scales},
-                LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(qk.data),
-                                        static_cast<std::int64_t>(qk.nb[1] / sizeof(__nv_bfloat16)),
-                                        0},
-                LinearIdentityEpilogue{}, q4.rows, q4.k, q4.padded_k, stream, q4.tokens,
-                x_stride)) {
-            launch_q4(x, qk_weight, qk, stream);
-        }
-        if (!try_launch_stream_gemv<Q5StreamFormat>(
-                q5.x, {q5.codes, q5.high, q5.scales}, q5_projection_output(value, z),
-                LinearIdentityEpilogue{}, q5.rows, q5.k, q5.padded_k, stream, q5.tokens,
-                x_stride)) {
-            launch_q5(x, value_z_weight, value, z, stream);
-        }
+    const std::int32_t hidden     = x.ne[0];
+    const std::int32_t value_rows = hidden == 5120 ? 6144 : hidden == 4096 ? 4096 : 0;
+    if (value_rows == 0) {
+        throw std::invalid_argument("Q4/Q5 GDN independent launch: unsupported hidden width");
+    }
+    if (hidden == 4096) {
+        independent_routes<4096, 4096>::launch(x, qk_weight, value_z_weight, qk, value, z,
+                                               stream);
         return;
     }
-#endif
-    if (x.ne[1] == 4) {
-        launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
-        return;
-    }
-    launch_q4(x, qk_weight, qk, stream);
-    launch_q5(x, value_z_weight, value, z, stream);
+    independent_routes<5120, 6144>::launch(x, qk_weight, value_z_weight, qk, value, z, stream);
 }
 
 } // namespace ninfer::ops::detail
