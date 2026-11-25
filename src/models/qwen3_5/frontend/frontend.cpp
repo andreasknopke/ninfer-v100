@@ -194,7 +194,13 @@ void validate_tokenizer_config(const FrontendResources& resources, Architecture 
         }
         return;
     }
-    if (tokenizer_config.value("add_bos_token", true) ||
+    // `add_bos_token` defaults to true in the HF tokenizers API, but a tokenizer that declares no
+    // BOS token has none to add. SenseNova-Loop-9B is such a release: `bos_token` is null and the
+    // field is omitted altogether. Reading the default as true there rejects a self-consistent
+    // configuration, so the default follows whether the tokenizer has a BOS at all.
+    const bool has_bos_token =
+        tokenizer_config.contains("bos_token") && !tokenizer_config.at("bos_token").is_null();
+    if (tokenizer_config.value("add_bos_token", has_bos_token) ||
         tokenizer_config.value("add_prefix_space", true)) {
         throw std::invalid_argument(
             "tokenizer_config.json does not match Qwen3.5 tokenizer prefix semantics");

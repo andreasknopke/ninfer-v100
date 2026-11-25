@@ -30,6 +30,15 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
+// The same Qwen pre-tokenizer as shipped before `\p{M}` (combining marks) was folded into its
+// character classes. SenseNova-Loop-9B's tokenizer.json spells it this way. The two agree on every
+// string whose letters are precomposed, which is all of ASCII and Latin-1; they differ only where a
+// letter is followed by a combining mark, where this pattern splits the mark off as its own piece.
+// Accepted as Qwen rather than rejected, so the model loads; text with detached combining marks
+// tokenizes slightly differently than the checkpoint saw.
+constexpr std::string_view kQwenSplitPatternNoMark =
+    R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
+
 // The DeepSeek-V4 pre-tokenizer, as tokenizer.json spells it (Hugging Face Split patterns, Oniguruma syntax).
 constexpr std::string_view kDsv4DigitsPattern = "\\p{N}{1,3}";
 constexpr std::string_view kDsv4CjkPattern    = "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+";
@@ -104,7 +113,9 @@ Pipeline validate_pipeline(const Json& root, const Json& model) {
             require(type(pre, "Sequence") && pre.contains("pretokenizers") &&
                         pre["pretokenizers"].is_array() && pre["pretokenizers"].size() == 2,
                     "pre_tokenizer");
-            require(is_split(pre["pretokenizers"][0], kQwenSplitPattern), "pre_tokenizer.Split");
+            require(is_split(pre["pretokenizers"][0], kQwenSplitPattern) ||
+                        is_split(pre["pretokenizers"][0], kQwenSplitPatternNoMark),
+                    "pre_tokenizer.Split");
             require(is_plain_byte_level(pre["pretokenizers"][1]), "pre_tokenizer.ByteLevel");
         }
     }
@@ -347,6 +358,15 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
                                 const std::unordered_set<int>& occupied_vocab_ids,
                                 const std::unordered_map<std::string, int>& occupied_vocab_tokens,
                                 std::vector<AddedToken>& tokens, Pipeline pipeline) {
+    // `added_tokens_decoder` is the legacy parallel description of the special tokens. Recent
+    // transformers releases write only tokenizer.json's `added_tokens`, which is authoritative and
+    // already loaded by `load_added_tokens`. With the field absent there is nothing to cross-check
+    // against, but the entries that came from tokenizer.json still have to satisfy the pipeline's
+    // constraints: the loop below is otherwise the only place that enforces them.
+    if (!root.contains("added_tokens_decoder")) {
+        for (const AddedToken& token : tokens) { validate_supported_added_token(token, label, pipeline); }
+        return;
+    }
     const Json& decoder = require_object_field(root, "added_tokens_decoder", label);
     std::unordered_map<int, std::size_t> token_by_id;
     std::unordered_map<std::string, int> token_by_content;

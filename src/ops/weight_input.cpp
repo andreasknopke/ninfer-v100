@@ -138,13 +138,21 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    require(dense || moe, "input projection: unsupported logical projection geometry");
+    // SenseNova-Loop-9B: hidden 4096, 16 query heads of 256 with a same-width output gate, 4 key
+    // heads of 256, and a GDN of 16 key heads of 128 over 32 value heads of 128.
+    const bool sensenova =
+        attention ? q == std::vector<std::uint64_t>{4096, 4096} &&
+                        k == std::vector<std::uint64_t>{1024, 4096} && third == q && fourth == k
+                  : q == std::vector<std::uint64_t>{2048, 4096} && k == q &&
+                        third == std::vector<std::uint64_t>{4096, 4096} && fourth == third;
+    require(dense || moe || sensenova, "input projection: unsupported logical projection geometry");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);
         const auto format = result.weight.qtype;
         const bool supported =
             (moe && format == QType::Q8_G32_FP16) ||
+            (sensenova && format == QType::BF16) ||
             (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
                        (attention && format == QType::BF16)));
         require(supported, "input projection: unsupported single-parent format");
@@ -204,7 +212,8 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
     const auto& shape = matrix(a);
     require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
-                                   shape == std::vector<std::uint64_t>{32, 2048}),
+                                   shape == std::vector<std::uint64_t>{32, 2048} ||
+                                   shape == std::vector<std::uint64_t>{32, 4096}),
             "GDN control: unsupported A/B geometry");
     const std::array inputs{a, b};
     if (contiguous(concatenate_rows(inputs))) {

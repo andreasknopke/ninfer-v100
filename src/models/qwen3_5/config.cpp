@@ -108,7 +108,11 @@ TextConfig text(const Json& value, bool mtp) {
         {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
          "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
          "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"},
+         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
+         // A loop model states its loop as extra blocks, so `layer_types` already counts
+         // execution slots. These carry the physical layout the weights and the stream
+         // routers are still indexed by, and are read by the stream-mixing stage.
+         "loop", "mhc", "yarn", "physical_layer_types"},
         "text config");
     TextConfig out;
     out.architecture = resolve_architecture(

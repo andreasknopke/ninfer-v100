@@ -6,6 +6,7 @@
 // names a real `config.json`, the same reader is run on it and the two must agree.
 
 #include "models/sensenova_loop/config.h"
+#include "models/qwen3_5/config.h"
 
 #include "artifact/reader.h"
 #include "artifact/schema.h"
@@ -17,9 +18,11 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -27,6 +30,7 @@ namespace {
 using ninfer::artifact::ArtifactError;
 using ninfer::artifact::Json;
 namespace artifact = ninfer::artifact;
+namespace qwen3_5  = ninfer::models::qwen3_5;
 using ninfer::models::sensenova_loop::ExecutionPlan;
 using ninfer::models::sensenova_loop::LayerKind;
 using ninfer::models::sensenova_loop::ModelConfig;
@@ -402,6 +406,22 @@ void test_against_real_file() {
 // unchanged, and the reader is strict about the field set it expects. Either side changing alone
 // breaks here rather than at load time on a 32 GB card. Gated behind NINFER_TEST_SENSENOVA_ARTIFACT
 // because it needs a converted artifact, which takes several minutes of CPU to produce.
+// The release document, when the environment names one. The artifact check needs it: the
+// converter expands the loop into blocks, `ExecutionPlan` expands it into slots, and the two
+// only mean the same model while their numbers agree. Distinct from `release_document` above,
+// which synthesises the document the tests write out.
+const Json* real_release_document() {
+    const char* path = std::getenv("NINFER_TEST_SENSENOVA_CONFIG");
+    if (path == nullptr) { return nullptr; }
+    static const Json document = [&] {
+        std::ifstream file(path);
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        return artifact::parse_json(buffer.str(), "release config");
+    }();
+    return &document;
+}
+
 void test_produced_artifact() {
     const char* path = std::getenv("NINFER_TEST_SENSENOVA_ARTIFACT");
     if (path == nullptr) {
@@ -411,38 +431,54 @@ void test_produced_artifact() {
     const artifact::Reader reader{std::filesystem::path{path}};
     const auto& directory = reader.directory();
 
-    check(is_sensenova_loop_config(directory), "the artifact is recognised as sensenova_loop");
-    const ModelConfig config = parse_config(directory);
-    const ExecutionPlan plan = build_plan(config);
+    // The loop is stated as blocks, so the plain Qwen3.5 loader is the loader: no
+    // dispatch, no new model. What it must see is 56 blocks whose state planes are
+    // already numbered per slot, which is what `compact_layer_indices` counts.
+    const qwen3_5::Config config = qwen3_5::parse_config(directory, {});
+    check_eq(config.text.num_hidden_layers, std::uint32_t{56}, "artifact block count");
+    check_eq(config.text.full_attention_layers, std::uint32_t{14}, "artifact KV planes");
+    check_eq(config.text.linear_attention_layers, std::uint32_t{42}, "artifact GDN planes");
+    check_eq(config.text.compact_layer_indices.size(), std::uint32_t{56},
+             "artifact plane index table");
+    // Block 55 repeats physical block 31, a full-attention one, and is the 14th.
+    check_eq(config.text.compact_layer_indices.back(), std::uint32_t{13},
+             "artifact last block plane index");
 
-    check_eq(config.text.architecture, std::string{"Qwen3_5LoopForConditionalGeneration"},
-             "artifact architecture");
-    check_eq(config.text.num_hidden_layers, std::uint32_t{32}, "artifact layer count");
-    check_eq(config.loop.start, std::uint32_t{4}, "artifact loop start");
-    check_eq(config.loop.end, std::uint32_t{28}, "artifact loop end");
-    check_eq(config.loop.visits, std::uint32_t{2}, "artifact loop visits");
-    check_eq(plan.slot_count(), std::uint32_t{56}, "artifact slot count");
-    check_eq(plan.full_attention_slots(), std::uint32_t{14}, "artifact full attention slots");
-    check_eq(plan.linear_attention_slots(), std::uint32_t{42}, "artifact linear attention slots");
-
-    // The routers are the artifact's only parameters the Qwen3.5 reader has no name for. If the
-    // converter dropped them, the runtime would have nothing to route with and no way to notice.
-    std::uint32_t routers = 0;
-    std::uint32_t coefficients = 0;
-    std::uint32_t biases = 0;
-    for (const auto& [name, binding] : directory.bindings) {
-        if (name.rfind("text/layers/", 0) != 0 || name.find("/mhc/") == std::string::npos) {
-            continue;
-        }
-        ++routers;
-        // 8 rows x (2 streams x 4096 hidden) for the coefficients, 8 for the bias.
-        if (name.ends_with("/coefficients") && binding.elements == 8U * 8192U) { ++coefficients; }
-        if (name.ends_with("/bias") && binding.elements == 8U) { ++biases; }
+    if (const Json* release = real_release_document(); release != nullptr) {
+        const ExecutionPlan plan = build_plan(parse_config(*release));
+        check_eq(plan.slot_count(), config.text.num_hidden_layers, "slot count agrees with plan");
+        check_eq(plan.full_attention_slots(), config.text.full_attention_layers,
+                 "KV planes agree with plan");
+        check_eq(plan.linear_attention_slots(), config.text.linear_attention_layers,
+                 "GDN planes agree with plan");
+    } else {
+        std::printf("  (no NINFER_TEST_SENSENOVA_CONFIG, plan cross-check skipped)\n");
     }
-    check_eq(routers, std::uint32_t{96}, "artifact mHC router tensors");
-    check_eq(coefficients, std::uint32_t{48}, "artifact mHC coefficient shapes");
-    check_eq(biases, std::uint32_t{48}, "artifact mHC bias shapes");
-    std::printf("  artifact reads back: %u slots, %u routers\n", plan.slot_count(), routers);
+
+    // Repeated blocks must bind the *same* objects, not copies. This is the claim
+    // that keeps the artifact on the card: 24 of the 56 blocks run twice, and if
+    // each carried its own weights the file would be roughly 11 GiB larger.
+    const auto count = [&](const std::string_view suffix, std::set<std::size_t>& objects) {
+        std::uint32_t seen = 0;
+        for (const auto& [name, binding] : directory.bindings) {
+            if (name.rfind("text/layers/", 0) != 0 || !name.ends_with(suffix)) { continue; }
+            ++seen;
+            for (const auto& part : binding.parts) { objects.insert(part.object.index); }
+        }
+        return seen;
+    };
+    std::set<std::size_t> projection_objects;
+    const auto projections = count("/attention/output", projection_objects);
+    check_eq(projections, std::uint32_t{14}, "attention output bindings");
+    check_eq(projection_objects.size(), std::uint32_t{8}, "distinct attention output objects");
+
+    std::set<std::size_t> router_objects;
+    const auto routers = count("/mhc/attn/coefficients", router_objects);
+    check_eq(routers, std::uint32_t{48}, "mHC coefficient bindings");
+    check_eq(router_objects.size(), std::uint32_t{24}, "distinct mHC coefficient objects");
+    std::printf("  artifact reads back: %u blocks, %u KV planes, %u weight objects behind them\n",
+                config.text.num_hidden_layers, config.text.full_attention_layers,
+                static_cast<unsigned>(projection_objects.size()));
 }
 
 } // namespace
