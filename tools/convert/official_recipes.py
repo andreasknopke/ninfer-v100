@@ -296,6 +296,29 @@ def qwen4_exp_gguf(model, recipe, sources):
         )
 
 
+def sensenova_loop_9b(model, recipe, sources):
+    """SenseNova-Loop-9B: the Qwen3.5 dense role split, unchanged.
+
+    The routers are not projections, so they keep the `fp32` the converter gave
+    them; only the projections are quantised here.
+    """
+    _dense_groupwise(model, recipe, Q6)
+
+
+def sensenova_loop_9b_bf16(model, recipe, sources):
+    """Every projection in bf16, for telling a wiring bug from a quantisation bug.
+
+    Larger than the quantised artifact and not a shipping recipe; it exists so a
+    first load can be checked against the checkpoint without four-bit error in
+    the way.
+    """
+    if "num_experts" in model.config:
+        raise ValueError("this recipe requires Qwen3.5 Dense mathematics")
+    for name, parameter in model.parameters.items():
+        if parameter.projection:
+            recipe.assign(name, format="bf16", method=cast_direct)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -305,4 +328,6 @@ RECIPES = {
     "qwen4_exp_gguf": qwen4_exp_gguf,
     "dsv4_gguf": dsv4_gguf,
     "inkling2_gguf": inkling2_gguf,
+    "sensenova_loop_9b": sensenova_loop_9b,
+    "sensenova_loop_9b_bf16": sensenova_loop_9b_bf16,
 }

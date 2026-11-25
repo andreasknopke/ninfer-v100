@@ -470,7 +470,7 @@ class _Builder:
                 ref = tensor_source(selected, selected_name, original)
                 return transpose_source(ref, transpose, shape)
             if len(original) == 2 and offset == 0:
-                ref = matrix_source(selected, selected_name, original, format)
+                ref = self.matrix(selected, selected_name, original, format)
                 return select_rows(ref, rows) if rows is not None else ref
             if format is not None:
                 raise ValueError(f"{name}: provide an explicit encoded source mapping")
@@ -489,6 +489,10 @@ class _Builder:
                 residency=name.split("/", 1)[0],
             )
         )
+
+    def matrix(self, store, name, shape, format):
+        """Resolve a 2-D parameter's source. Subclasses override the encoding."""
+        return matrix_source(store, name, shape, format)
 
     def group(self, *names):
         self.model.packing_groups.append(tuple(names))

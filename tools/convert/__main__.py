@@ -14,7 +14,7 @@ from .official_recipes import RECIPES
 from .pipeline import convert, discard
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
-from . import dsv4, dsv4_engram, dsv4_model, inkling2, inkling2_model, qwen4_exp
+from . import dsv4, dsv4_engram, dsv4_model, inkling2, inkling2_model, qwen4_exp, sensenova_loop
 from .recipe import Recipe
 from .sources.gguf import GgufModel
 from .sources.gguf_ternary import GGUFFile
@@ -249,12 +249,23 @@ def main(argv=None):
             }
             if "mtp" in components and "mtp" in paths:
                 companions["mtp"] = sources["mtp"]
-            model = build_model(
-                base,
-                components=components,
-                companions=companions,
-                resource_overrides=overrides,
-            )
+            if base.config.get("architectures") == [sensenova_loop.ARCHITECTURE]:
+                # SenseNova-Loop-9B: the AWQ matrices and the loop and mHC
+                # settings are the only differences from Qwen3.5, so the builder
+                # is shared and only the matrix source and config differ.
+                model = sensenova_loop.build_model(
+                    base,
+                    components=components,
+                    companions=companions,
+                    resource_overrides=overrides,
+                )
+            else:
+                model = build_model(
+                    base,
+                    components=components,
+                    companions=companions,
+                    resource_overrides=overrides,
+                )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:
