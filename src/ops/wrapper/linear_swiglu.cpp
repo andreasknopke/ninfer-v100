@@ -159,8 +159,14 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                           gate_up_weight.padded_shape[1] == 2048;
+    // SenseNova-Loop-9B: gate and up fused to 24576 rows over a 4096 hidden, halved to a 12288
+    // intermediate. The Q4 plan already registers this profile.
+    const bool loop9b_shape = x.ne[0] == 4096 && out.ne[0] == 12288 &&
+                              gate_up_weight.n == 24576 && gate_up_weight.k == 4096 &&
+                              gate_up_weight.padded_shape[0] == 24576 &&
+                              gate_up_weight.padded_shape[1] == 4096;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !q8_shape)) {
+        out.ne[3] != 1 || (!large_shape && !q8_shape && !loop9b_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -176,7 +182,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
-    const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
+    const bool q4_weight = (large_shape || loop9b_shape) &&
+                           gate_up_weight.qtype == QType::Q4_G64_FP16 &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
     const bool q8_weight =
