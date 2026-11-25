@@ -76,7 +76,22 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             issue.template operator()<false, false>();
         }
     };
-    if constexpr (TokenTile >= 6) {
+    if constexpr (Geometry::GroupSize == 4 && TokenTile >= 5) {
+        // SenseNova-Loop-9B's group of four fills two Q row tiles at T=5..6, where the 35B-A3B's
+        // group of eight fills three. The kernel splits D across ConsumerWarpsPerTile = Warps /
+        // RowTiles and requires that to divide 32 exactly, so the 24/12/6-warp tiers above would
+        // truncate here. These counts keep the same consumer-warp-per-tile counts (8, 4, 4, 2) as
+        // the 35B-A3B's tiers, which is what its PV tiling divides by.
+        if (implementation_window > 128 && implementation_window <= 160) {
+            launch.template operator()<16, 1, 32, false>();
+        } else if (implementation_window <= 2054) {
+            launch.template operator()<8, 1, 32, false>();
+        } else if (implementation_window <= 8198) {
+            launch.template operator()<8, 1, 64, true>();
+        } else {
+            launch.template operator()<4, 2, 32, false>();
+        }
+    } else if constexpr (TokenTile >= 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
         if (implementation_window > 128 && implementation_window <= 160) {

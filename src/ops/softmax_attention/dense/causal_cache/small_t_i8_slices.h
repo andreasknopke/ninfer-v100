@@ -55,4 +55,14 @@ void causal_small_t_i8_g16_t4(const SmallTI8SliceArgs& args);
 void causal_small_t_i8_g16_t5(const SmallTI8SliceArgs& args);
 void causal_small_t_i8_g16_t6(const SmallTI8SliceArgs& args);
 
+// SenseNova-Loop-9B geometry (CausalD256H16Kv4): query-row tiles 1..6. Same query-head count as
+// the 35B-A3B but a GQA group of four instead of eight, so the partial kernel is a different
+// instantiation and cannot be shared.
+void causal_small_t_i8_g16kv4_t1(const SmallTI8SliceArgs& args);
+void causal_small_t_i8_g16kv4_t2(const SmallTI8SliceArgs& args);
+void causal_small_t_i8_g16kv4_t3(const SmallTI8SliceArgs& args);
+void causal_small_t_i8_g16kv4_t4(const SmallTI8SliceArgs& args);
+void causal_small_t_i8_g16kv4_t5(const SmallTI8SliceArgs& args);
+void causal_small_t_i8_g16kv4_t6(const SmallTI8SliceArgs& args);
+
 } // namespace ninfer::ops::detail

@@ -24,5 +24,8 @@ struct CausalAttentionGeometry : AttentionHeadMapping<QHeadsValue, KVHeadsValue>
 // For the 27B, caps of 82, 123 and 164 were each slower than 41 somewhere in 32K..128K.
 using CausalD256H24Kv4 = CausalAttentionGeometry<24, 4, 1, 41>;
 using CausalD256H16Kv2 = CausalAttentionGeometry<16, 2, 2, 41>;
+// SenseNova-Loop-9B: 16 query heads over 4 KV heads, so a group of four rather than the 35B's
+// eight. Split scale 2 matches the 35B's, which has the same query-head count.
+using CausalD256H16Kv4 = CausalAttentionGeometry<16, 4, 2, 41>;
 
 } // namespace ninfer::ops

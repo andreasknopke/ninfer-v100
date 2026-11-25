@@ -30,8 +30,10 @@ struct CausalSmallTInvocation {
     std::int32_t batch_size     = 1;
 };
 
-std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                             KvCacheStorage cache_storage,
+// The split grid is (KVHeads, splits, batch), and two registered geometries share a query-head
+// count (16q/2kv on the 35B-A3B, 16q/4kv on SenseNova-Loop-9B), so both counts are needed.
+std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
+                                             std::int32_t tokens, KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size = 1);
 
@@ -169,12 +171,13 @@ inline constexpr std::int32_t kVoltaFlashMinimumWidth = 17;
 inline constexpr std::int32_t kVoltaFlashMaskRowPad   = 64;
 inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
 
-std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens);
+std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t kv_heads,
+                                                       std::int32_t tokens);
 
 // Kernels one flash call enqueues (append: the growing-cache form, which appends K/V first).
-std::uint32_t causal_attention_volta_flash_kernel_nodes(std::int32_t q_heads, bool append,
-                                                       std::int32_t width,
-                                                       std::int32_t visible_keys);
+std::uint32_t causal_attention_volta_flash_kernel_nodes(std::int32_t q_heads, std::int32_t kv_heads,
+                                                        bool append, std::int32_t width,
+                                                        std::int32_t visible_keys);
 
 void causal_attention_volta_flash_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,

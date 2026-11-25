@@ -120,8 +120,8 @@ std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope env
 
 } // namespace
 
-std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                             KvCacheStorage cache_storage,
+std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
+                                             std::int32_t tokens, KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size) {
     if (tokens < 1 || tokens > (q_heads == 24 ? 8 : 6) || envelope.min_visible_keys == 0 ||
@@ -150,8 +150,11 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
         }
         return capacity;
     }
-    if (q_heads == CausalD256H16Kv2::QHeads) {
+    if (q_heads == CausalD256H16Kv2::QHeads && kv_heads == CausalD256H16Kv2::KVHeads) {
         return causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_storage);
+    }
+    if (q_heads == CausalD256H16Kv4::QHeads && kv_heads == CausalD256H16Kv4::KVHeads) {
+        return causal_small_t_launch_capacity<CausalD256H16Kv4>(envelope, tokens, cache_storage);
     }
     throw std::invalid_argument(
         "causal_softmax_attention split capacity: unsupported head geometry");
@@ -168,7 +171,8 @@ void causal_attention_small_t_launch_for(const Tensor& q, bool append_input, con
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits                = causal_attention_split_capacity(
-        Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
+        Geometry::QHeads, Geometry::KVHeads, invocation.width, cache.storage, envelope,
+        invocation.batch_size);
 
     // BF16 small-T attention now lives entirely in bf16/launch.cu (bf16_kv_append_attention /
     // bf16_kv_cached_attention), reached before route resolution; only the int8 family reaches
@@ -180,10 +184,15 @@ void causal_attention_small_t_launch_for(const Tensor& q, bool append_input, con
     static constexpr SmallTI8SliceFn kG16Slices[] = {
         causal_small_t_i8_g16_t1, causal_small_t_i8_g16_t2, causal_small_t_i8_g16_t3,
         causal_small_t_i8_g16_t4, causal_small_t_i8_g16_t5, causal_small_t_i8_g16_t6};
+    static constexpr SmallTI8SliceFn kG16Kv4Slices[] = {
+        causal_small_t_i8_g16kv4_t1, causal_small_t_i8_g16kv4_t2, causal_small_t_i8_g16kv4_t3,
+        causal_small_t_i8_g16kv4_t4, causal_small_t_i8_g16kv4_t5, causal_small_t_i8_g16kv4_t6};
     constexpr int kMaxTokens = Geometry::QHeads == 24 ? 8 : 6;
     const SmallTI8SliceFn* slices;
     if constexpr (Geometry::QHeads == 24) {
         slices = kG24Slices;
+    } else if constexpr (Geometry::KVHeads == 4) {
+        slices = kG16Kv4Slices;
     } else {
         slices = kG16Slices;
     }
@@ -285,6 +294,14 @@ void causal_attention_small_t_launch(
             partial_m, partial_l, out, stream);
         return;
     }
+    // 16 query heads is two different models: the 35B-A3B with two KV heads and
+    // SenseNova-Loop-9B with four.
+    if (cache.num_kv_heads == CausalD256H16Kv4::KVHeads) {
+        causal_attention_small_t_launch_for<CausalD256H16Kv4>(
+            q, true, k.data, v.data, pos, scale, cache, invocation, envelope, partial_acc,
+            partial_m, partial_l, out, stream);
+        return;
+    }
     causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, true, k.data, v.data, pos, scale,
                                                           cache, invocation, envelope, partial_acc,
                                                           partial_m, partial_l, out, stream);
@@ -321,6 +338,12 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
     const PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(
+            q, false, nullptr, nullptr, pos, scale, batch_cache, invocation, envelope,
+            partial_acc, partial_m, partial_l, out, stream);
+        return;
+    }
+    if (cache.num_kv_heads == CausalD256H16Kv4::KVHeads) {
+        causal_attention_small_t_launch_for<CausalD256H16Kv4>(
             q, false, nullptr, nullptr, pos, scale, batch_cache, invocation, envelope,
             partial_acc, partial_m, partial_l, out, stream);
         return;

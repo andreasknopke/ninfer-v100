@@ -41,9 +41,12 @@ constexpr std::int32_t kMaximumVerifyTokens = 16;
 constexpr std::int32_t kMaximumBatchSize    = 8;
 
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
+    // SenseNova-Loop-9B shares the 35B-A3B's query-head count, so the KV-head count is part of the
+    // admission test and is never derived from the query-head count.
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
+          (geometry.query_heads == 16 && geometry.kv_heads == 2) ||
+          (geometry.query_heads == 16 && geometry.kv_heads == 4))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
@@ -418,9 +421,8 @@ struct VoltaFlashWorkspace {
 
 template <class Allocator>
 VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::int32_t q_heads,
-                                                   std::int32_t width,
+                                                   std::int32_t kv_heads, std::int32_t width,
                                                    CausalAttentionExecutionEnvelope envelope) {
-    const std::int32_t kv_heads = q_heads == 24 ? 4 : 2; // CausalD256H24Kv4 / CausalD256H16Kv2
     const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
     const std::int32_t n_kv =
         ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
@@ -435,7 +437,8 @@ VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::in
         workspace.alloc(DType::FP32,
                         {2,
                          static_cast<std::int32_t>(
-                             detail::causal_attention_volta_flash_meta_elements(q_heads, tokens)),
+                             detail::causal_attention_volta_flash_meta_elements(q_heads, kv_heads,
+                                                                                tokens)),
                          1, 1}),
     };
 }
@@ -454,8 +457,8 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
 
 template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
-                            KvCacheStorage cache_storage, CausalAttentionExecutionEnvelope envelope,
-                            Tensor& out, Launch&& launch) {
+                            KvCacheStorage cache_storage, std::int32_t kv_heads,
+                            CausalAttentionExecutionEnvelope envelope, Tensor& out, Launch&& launch) {
     for (std::int32_t begin = 0; begin < q.ne[2];
          begin +=
          causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
@@ -463,8 +466,8 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
             causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
             q.ne[2] - begin);
         auto chunk_scope = workspace.scope();
-        const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], count, cache_storage, envelope);
+        const std::int32_t splits = detail::causal_attention_split_capacity(
+            q.ne[1], kv_heads, count, cache_storage, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits, 1);
         Tensor q_chunk          = q.slice(2, begin, count);
         Tensor position_chunk   = positions.slice(0, begin, count);
@@ -486,7 +489,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                                              q.ne[2] - begin);
         auto chunk_scope          = workspace.scope();
         const std::int32_t splits = detail::causal_attention_split_capacity(
-            q.ne[1], count, cache.storage, envelope, q.ne[3]);
+            q.ne[1], cache.num_kv_heads, count, cache.storage, envelope, q.ne[3]);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
@@ -500,7 +503,7 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
                                    CausalAttentionExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     for_each_small_t_chunk(
-        q, positions, workspace, cache.storage, envelope, out,
+        q, positions, workspace, cache.storage, cache.num_kv_heads, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
             SmallTWorkspace& partial, Tensor& out_chunk) {
             detail::causal_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
@@ -618,7 +621,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         // causal_softmax_attention), so it is that call's whole workspace.
         if (volta_flash_route_possible(q_heads, width, batch_size, cache_storage)) {
             WorkspaceLayoutBuilder layout;
-            (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
+            (void)allocate_volta_flash_workspace(layout, q_heads, geometry.kv_heads, width,
+                                                 envelope);
             return layout.peak_bytes(1);
         }
 #endif
@@ -630,7 +634,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     };
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits = detail::causal_attention_split_capacity(
-            q_heads, width, cache_storage, envelope, batch_size);
+            q_heads, geometry.kv_heads, width, cache_storage, envelope, batch_size);
         WorkspaceLayoutBuilder layout;
         (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
@@ -725,7 +729,8 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
         volta_flash_route_possible(geometry.query_heads, tokens, batch_size, cache_storage)) {
         shape.route |= 1U << 18U;
         shape.kernel_nodes = detail::causal_attention_volta_flash_kernel_nodes(
-            geometry.query_heads, true, tokens, static_cast<std::int32_t>(envelope.max_visible_keys));
+            geometry.query_heads, geometry.kv_heads, true, tokens,
+            static_cast<std::int32_t>(envelope.max_visible_keys));
         return shape;
     }
 #endif
@@ -799,7 +804,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (route == detail::CausalAttentionRoute::Prompt &&
         volta_flash_route_possible(q.ne[1], width, batch, cache.storage)) {
         VoltaFlashWorkspace staging =
-            allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+            allocate_volta_flash_workspace(workspace, q.ne[1], cache.num_kv_heads, width, envelope);
         detail::causal_attention_volta_flash_launch(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope,
             detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered, staging.mask,
@@ -814,7 +819,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
         const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
+            detail::causal_attention_split_capacity(q.ne[1], cache.num_kv_heads, width,
+                                                    cache.storage, envelope, batch);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
@@ -881,7 +887,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     if (route == detail::CausalAttentionRoute::Prompt &&
         volta_flash_route_possible(q.ne[1], q.ne[2], 1, cache.storage)) {
         VoltaFlashWorkspace staging =
-            allocate_volta_flash_workspace(workspace, q.ne[1], q.ne[2], envelope);
+            allocate_volta_flash_workspace(workspace, q.ne[1], cache.num_kv_heads, q.ne[2],
+                                           envelope);
         Tensor table_rows; // null: the view's single table row
         detail::causal_attention_volta_flash_launch(
             q, Tensor{}, Tensor{}, positions, Tensor{}, table_rows, scale,
@@ -897,7 +904,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
         const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], q.ne[2], cache.storage, envelope);
+            detail::causal_attention_split_capacity(q.ne[1], cache.num_kv_heads, q.ne[2],
+                                                    cache.storage, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1);
         detail::causal_attention_cached_small_t_launch(
