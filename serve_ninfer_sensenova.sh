@@ -60,6 +60,11 @@ ARGS=(
     # The loop's 14 KV planes are the tight allocation, so ask for exactly the
     # context asked for instead of leaving the 1 GiB the "auto" sizing reserves.
     --kv-capacity "$CTX"
+    # The Q4/Q5 cuBLAS prefill route dequantises each weight once per chunk and
+    # runs the GEMM over the tokens in it, so a wide chunk amortises the dequant.
+    # 4096 is where the MLP + projection promotion pays off (prefill ~2.4k tok/s
+    # vs ~200 on the emulated-MMA path); matches the Inkling launcher.
+    --prefill-chunk 4096
 )
 
 echo "=============================================="

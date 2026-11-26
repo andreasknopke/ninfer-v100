@@ -140,6 +140,10 @@ public:
                             rotated_linear(w.down)};
         integer_route(out.gate_up, {QType::Q4_G64_FP16, QType::T2_G128_FP16}, 34816, 5120);
         integer_route(out.down, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 17408);
+        // SenseNova-Loop-9B geometry (hidden 4096, MLP 24576/12288). Same promotion as the 27B
+        // shapes above: without it the MLP stays on the emulated-MMA path and prefill crawls.
+        integer_route(out.gate_up, {QType::Q4_G64_FP16}, 24576, 4096);
+        integer_route(out.down, {QType::Q5_G64_FP16}, 4096, 12288);
         // --mlp-a8-decode is a separate verify-phase trade from --prefill-a8: it must admit the
         // decode route by this profile's own format/shape, not by whether prefill promotion
         // already ran, so the two flags stay orthogonal as documented.
@@ -190,6 +194,10 @@ public:
                                7168, 5120);
             integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
                                7168, 5120);
+            // SenseNova-Loop-9B attention (hidden 4096, out_proj 4096x4096, proj pair 5120/5120).
+            integer_route(attention_output, {QType::Q5_G64_FP16}, 4096, 4096);
+            integer_route_pair(attention_projection, QType::Q4_G64_FP16, 5120, QType::Q5_G64_FP16,
+                               5120, 4096);
             out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
                                             tensor(a->key_norm), std::move(attention_output)};
             out.projection_prefetch =
@@ -205,6 +213,10 @@ public:
                                5120);
             integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
                                12288, 5120);
+            // SenseNova-Loop-9B GDN (hidden 4096, output 4096x4096, proj pair qk 4096 / value_z 8192).
+            integer_route(gdn_output, {QType::Q5_G64_FP16}, 4096, 4096);
+            integer_route_pair(gdn_projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 8192,
+                               4096);
             out.mixer = GdnParameters{
                 std::move(gdn_projection),
                 ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
