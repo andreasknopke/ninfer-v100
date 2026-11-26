@@ -179,6 +179,59 @@ int run_q4_q5() {
     return failures;
 }
 
+// SenseNova-Loop-9B fuses query and gate in the source tensor, so its attention-input parents are
+// 4096 query rows + 1024 kv rows over a 4096 hidden (not the 27B 6144 rows over 5120). This
+// exercises the Q4/Q5 Mixed schedules at that geometry across the 64-column route boundary.
+int run_q4_q5_sensenova_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value,
+                             int tokens) {
+    constexpr int hidden = 4096, qrows = 4096, kvrows = 1024;
+    const auto activation      = make_bf16_activation(hidden, tokens, 401U + tokens);
+    const auto activation_bits = bf16_bits(activation);
+    DeviceBuffer input         = to_device(activation_bits);
+    GuardedBf16Tensor query(qrows, tokens), gate(qrows, tokens), key(kvrows, tokens),
+        value(kvrows, tokens);
+    Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
+                                                      k = key.tensor(), v = value.tensor();
+    DeviceContext device;
+    const auto first    = physical_parent(query_key.view());
+    const auto second   = physical_parent(gate_value.view());
+    const auto q_weight = rows(first, 0, qrows), k_weight = rows(first, qrows, kvrows);
+    const auto g_weight = rows(second, 0, qrows), v_weight = rows(second, qrows, kvrows);
+    const auto prepared = ops::prepare_attn_input_proj_weights(
+        {q_weight, ops::LinearPolicy::A16Only}, {k_weight, ops::LinearPolicy::A16Only},
+        {g_weight, ops::LinearPolicy::A16Only}, {v_weight, ops::LinearPolicy::A16Only});
+    const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared);
+    if (pair == nullptr) {
+        std::cerr << "sensenova Q4/Q5 attention input did not prepare a paired projection\n";
+        return 1;
+    }
+    ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, device.stream);
+    cuda_synchronize(device.stream);
+    const std::string suffix = " Q4/Q5 sensenova T=" + std::to_string(tokens);
+    int failures             = 0;
+    failures += verify_output("attn q" + suffix, query, query_key.host, 0, qrows, activation,
+                              hidden, tokens, kAttnInputProjA16Tolerance, 31);
+    failures += verify_output("attn k" + suffix, key, query_key.host, qrows, kvrows, activation,
+                              hidden, tokens, kAttnInputProjA16Tolerance, 31);
+    failures += verify_output("attn gate" + suffix, gate, gate_value.host, 0, qrows, activation,
+                              hidden, tokens, kAttnInputProjA16Tolerance, 31);
+    failures += verify_output("attn value" + suffix, value, gate_value.host, qrows, kvrows,
+                              activation, hidden, tokens, kAttnInputProjA16Tolerance, 31);
+    return failures;
+}
+
+int run_q4_q5_sensenova() {
+    constexpr std::int32_t kHidden = 4096, kParent = 5120;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4_G64_FP16, kParent, kHidden, 403U));
+    DevicePackedWeight gate_value(
+        quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, kParent, kHidden, 407U));
+    int failures = 0;
+    for (int t : {1, 17, 62, 63, 64, 65, 66, 68, 96, 104, 128, 129, 193})
+        failures += run_q4_q5_sensenova_case(query_key, gate_value, t);
+    return failures;
+}
+
 // The ternary pair through the policy form: the integer routes (one quantisation, each parent split
 // into its two destinations), the small-T kernel up to 192 tokens and the padded GEMM above it.
 int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value, int tokens) {
@@ -719,6 +772,7 @@ int main(int argc, char** argv) {
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
     if (!dflash2_only) {
         failures += run_q4_q5();
+        failures += run_q4_q5_sensenova();
         failures += run_t2();
         failures += run_bf16_target();
         failures += run_nvfp4_target();

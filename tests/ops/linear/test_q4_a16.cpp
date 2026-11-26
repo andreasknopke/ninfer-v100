@@ -221,6 +221,23 @@ int q4_a16_conformance() {
     return failures;
 }
 
+// SenseNova-Loop-9B's dense projections over a 4096 hidden: the fused gate/up MLP (24576 x 4096),
+// the down projection (4096 x 12288), and the attention output projection (4096 x 4096). Each
+// width straddles the sm_70 route boundary where the streaming GEMV hands off to the shape table.
+int q4_a16_sensenova() {
+    int failures = 0;
+    constexpr std::array kWidths{
+        a16(1), a16(62), a16(63), a16(64), a16(65), a16(66), a16(68), a16(96), a16(128), a16(193),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {24576, 4096, 201U, Comparison::SampledRows, false, kWidths});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {4096, 12288, 203U, Comparison::SampledRows, false, kWidths});
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {4096, 4096, 205U, Comparison::SampledRows, false, kWidths});
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -230,7 +247,7 @@ int main() {
     }
 
     try {
-        const int failures = q4_a16_conformance();
+        const int failures = q4_a16_conformance() + q4_a16_sensenova();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q4_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

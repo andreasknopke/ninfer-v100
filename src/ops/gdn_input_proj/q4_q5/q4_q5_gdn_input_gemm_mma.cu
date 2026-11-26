@@ -54,7 +54,11 @@ using GdnInputC128Schedule = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, tru
 template <class Schedule>
 void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                   Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    constexpr std::int32_t kValueRows = 6144;
+    // value and z are the two equal halves of value_z_weight. The row count follows the actual
+    // weight, not a fixed profile: Qwen3.5-27B splits 12288 into 6144 + 6144, SenseNova-Loop-9B
+    // splits 8192 into 4096 + 4096. Hardcoding 6144 makes the output_gate job read past the end of
+    // a narrower value_z_weight and write garbage into z.
+    const std::int32_t kValueRows = value_z_weight.n / 2;
     const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv, 0);
     const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv, qk_weight.n);
     const RowSplitGroupedMmaJob output_gate =

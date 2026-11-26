@@ -131,7 +131,12 @@ static void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
         launch_q4_simt<Q4AttnSimtR8T4Schedule>(x, weight, q, key, stream);
         return;
     default:
-        throw std::invalid_argument("attention Q4 split-output requires T in [1,12]");
+        // sm_70: the SIMT tile slices arbitrary token counts (for_each_token_slice), so it is the
+        // Volta-safe fallback for every width the streaming GEMV and the sm_89 MMA schedules do not
+        // cover. The MMA schedules produce wrong Q/K/V on Volta, so prefill widths above the GEMV
+        // band route here.
+        launch_q4_simt<Q4AttnSimtR8T4Schedule>(x, weight, q, key, stream);
+        return;
     }
 }
 
@@ -221,7 +226,10 @@ static void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tenso
         launch_q5_simt<4>(x, weight, gate, value, stream);
         return;
     }
-    throw std::invalid_argument("attention Q5 split-output requires T in [1,12]");
+    // sm_70: the SIMT tile slices arbitrary token counts (for_each_token_slice), so it is the
+    // Volta-safe fallback for every width above the split4/GEMV bands. The sm_89 MMA schedules
+    // produce wrong Q/K/V on Volta, so prefill widths route here.
+    launch_q5_simt<4>(x, weight, gate, value, stream);
 }
 
 

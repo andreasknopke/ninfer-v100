@@ -56,19 +56,19 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Schedule>
+template <class Schedule, std::int32_t kSplitRow>
 void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
                   Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     const bool full = (x.ne[1] % Schedule::BN) == 0;
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
-        full, x, make_job(query_key_weight, 0, 6144, q), make_job(query_key_weight, 6144, 1024, k),
-        stream);
+        full, x, make_job(query_key_weight, 0, kSplitRow, q),
+        make_job(query_key_weight, kSplitRow, 1024, k), stream);
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
-        full, x, make_job(gate_value_weight, 0, 6144, gate),
-        make_job(gate_value_weight, 6144, 1024, v), stream);
+        full, x, make_job(gate_value_weight, 0, kSplitRow, gate),
+        make_job(gate_value_weight, kSplitRow, 1024, v), stream);
 }
 
-template <class Schedule>
+template <class Schedule, std::int32_t kHidden, std::int32_t kSplitRow>
 void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
             Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     constexpr std::int32_t kSliceCols = Schedule::BN;
@@ -78,8 +78,8 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
         Tensor gate_slice    = gate.slice(1, offset, count);
         Tensor k_slice       = k.slice(1, offset, count);
         Tensor v_slice       = v.slice(1, offset, count);
-        launch_slice<Schedule>(x_slice, query_key_weight, gate_value_weight, q_slice, gate_slice,
-                               k_slice, v_slice, stream);
+        launch_slice<Schedule, kSplitRow>(x_slice, query_key_weight, gate_value_weight, q_slice,
+                                          gate_slice, k_slice, v_slice, stream);
     });
 }
 
@@ -89,19 +89,22 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
 using MmaR32C32S4 = GemmCfg<32, 32, 64, 16, 16, 4, 1, false, true, true>;
 using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
 
-template <class S, bool Full>
+template <class S, bool Full, std::int32_t kHidden, std::int32_t kSplitRow>
 void mixed_slice(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,
                  Tensor& k, Tensor& v, cudaStream_t stream) {
-    const dim3 grid(14336 / S::BM, (x.ne[1] + S::BN - 1) / S::BN);
+    // The grid spans both parents of both weights: (query + kv) rows, twice.
+    const dim3 grid((kSplitRow + 1024) * 2 / S::BM, (x.ne[1] + S::BN - 1) / S::BN);
     rowsplit_grouped_mma_kernel<S, Full, RowSplitGroupedMmaCodec::Mixed, 4>
         <<<grid, S::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                          make_job(w0, 0, 6144, q), make_job(w0, 6144, 1024, k),
-                                          make_job(w1, 0, 6144, g), make_job(w1, 6144, 1024, v),
-                                          5120, x.ne[1], 5120);
+                                          make_job(w0, 0, kSplitRow, q),
+                                          make_job(w0, kSplitRow, 1024, k),
+                                          make_job(w1, 0, kSplitRow, g),
+                                          make_job(w1, kSplitRow, 1024, v), kHidden, x.ne[1],
+                                          kHidden);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class S>
+template <class S, std::int32_t kHidden, std::int32_t kSplitRow>
 void launch_mixed(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,
                   Tensor& k, Tensor& v, cudaStream_t stream) {
     for_each_token_slice(x.ne[1], S::BN, [&](int begin, int count) {
@@ -109,10 +112,31 @@ void launch_mixed(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q
         Tensor qs = q.slice(1, begin, count), gs = g.slice(1, begin, count),
                ks = k.slice(1, begin, count), vs = v.slice(1, begin, count);
         if (count % S::BN == 0)
-            mixed_slice<S, true>(xs, w0, w1, qs, gs, ks, vs, stream);
+            mixed_slice<S, true, kHidden, kSplitRow>(xs, w0, w1, qs, gs, ks, vs, stream);
         else
-            mixed_slice<S, false>(xs, w0, w1, qs, gs, ks, vs, stream);
+            mixed_slice<S, false, kHidden, kSplitRow>(xs, w0, w1, qs, gs, ks, vs, stream);
     });
+}
+
+// The 27B attention input is a 6144-row query parent over a 5120 hidden; SenseNova-Loop-9B
+// fuses query and gate in the source tensor, so its parents are 4096 rows over a 4096 hidden.
+// The kv parent is 1024 rows in both. Dispatch on the hidden width carried by x.
+template <class Schedule>
+void dispatch_launch(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,
+                     Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (x.ne[0] == 4096)
+        launch<Schedule, 4096, 4096>(x, w0, w1, q, g, k, v, stream);
+    else
+        launch<Schedule, 5120, 6144>(x, w0, w1, q, g, k, v, stream);
+}
+
+template <class Schedule>
+void dispatch_mixed(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,
+                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (x.ne[0] == 4096)
+        launch_mixed<Schedule, 4096, 4096>(x, w0, w1, q, g, k, v, stream);
+    else
+        launch_mixed<Schedule, 5120, 6144>(x, w0, w1, q, g, k, v, stream);
 }
 
 } // namespace
@@ -121,40 +145,41 @@ void q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(const Tensor& x, const Weigh
                                                     const Weight& gate_value_weight, Tensor& q,
                                                     Tensor& gate, Tensor& k, Tensor& v,
                                                     cudaStream_t stream) {
-    launch<MmaR32C32S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+    dispatch_launch<MmaR32C32S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
 }
 
 void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weight& query_key_weight,
                                                     const Weight& gate_value_weight, Tensor& q,
                                                     Tensor& gate, Tensor& k, Tensor& v,
                                                     cudaStream_t stream) {
-    launch<MmaR32C64S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+    dispatch_launch<MmaR32C64S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
 }
 
 void q4_q5_attn_input_mixed_r32_c32_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
                                               cudaStream_t stream) {
-    launch_mixed<GemmCfg<32, 32, 64, 16, 16, 2, 1, false, true, true>>(x, w0, w1, q, g, k, v,
-                                                                       stream);
+    dispatch_mixed<GemmCfg<32, 32, 64, 16, 16, 2, 1, false, true, true>>(x, w0, w1, q, g, k, v,
+                                                                         stream);
 }
 
 void q4_q5_attn_input_mixed_r32_c64_s3_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
                                               cudaStream_t stream) {
-    launch_mixed<GemmCfg<32, 64, 64, 16, 16, 3, 3, false, true, true>>(x, w0, w1, q, g, k, v,
-                                                                       stream);
+    dispatch_mixed<GemmCfg<32, 64, 64, 16, 16, 3, 3, false, true, true>>(x, w0, w1, q, g, k, v,
+                                                                         stream);
 }
 
 void q4_q5_attn_input_pair_r32_c64_s3_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                              Tensor& q, Tensor& g, Tensor& k, Tensor& v,
                                              cudaStream_t stream) {
-    launch<GemmCfg<32, 64, 64, 32, 16, 3, 2, false, true, true>>(x, w0, w1, q, g, k, v, stream);
+    dispatch_launch<GemmCfg<32, 64, 64, 32, 16, 3, 2, false, true, true>>(x, w0, w1, q, g, k, v,
+                                                                          stream);
 }
 
 void q4_q5_attn_input_mixed_r64_c128_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                                Tensor& q, Tensor& g, Tensor& k, Tensor& v,
                                                cudaStream_t stream) {
-    launch_mixed<GemmCfg<64, 128, 64, 64, 16, 2, 2, false, true, true>>(x, w0, w1, q, g, k, v,
-                                                                        stream);
+    dispatch_mixed<GemmCfg<64, 128, 64, 64, 16, 2, 2, false, true, true>>(x, w0, w1, q, g, k, v,
+                                                                          stream);
 }
 } // namespace ninfer::ops::detail
