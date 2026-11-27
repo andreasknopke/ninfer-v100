@@ -8,6 +8,7 @@
 #    include <sys/socket.h>
 #endif
 
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -18,7 +19,24 @@ namespace {
 constexpr int kKeepAliveIdleSeconds                = 10;
 constexpr int kKeepAliveIntervalSeconds            = 3;
 constexpr int kKeepAliveProbeCount                 = 3;
-constexpr unsigned int kTcpUserTimeoutMilliseconds = 15000;
+// Upstream used 15000 ms here. TCP_USER_TIMEOUT aborts a connection whose
+// transmitted data stays unacknowledged, so a client that merely reads slower
+// than we generate (or pauses briefly) would have its stream reset mid-answer
+// with no finish_reason and no [DONE]. Slow is not dead: the TCP keepalive
+// probes below still detect a genuinely dead peer. Override with
+// NINFER_TCP_USER_TIMEOUT_MS (0 disables the option entirely).
+constexpr unsigned int kDefaultTcpUserTimeoutMilliseconds = 600000;
+
+unsigned int tcp_user_timeout_milliseconds() noexcept {
+    if (const char* env = std::getenv("NINFER_TCP_USER_TIMEOUT_MS")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(env, &end, 10);
+        if (end != env && end != nullptr && *end == '\0') {
+            return static_cast<unsigned int>(parsed);
+        }
+    }
+    return kDefaultTcpUserTimeoutMilliseconds;
+}
 
 template <class T>
 void set_socket_option(socket_t socket, int level, int option, const T& value) noexcept {
@@ -89,7 +107,10 @@ void configure_http_server_socket(socket_t socket) noexcept {
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
-    set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+    const unsigned int user_timeout_ms = tcp_user_timeout_milliseconds();
+    if (user_timeout_ms != 0) {
+        set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, user_timeout_ms);
+    }
 #endif
 }
 
